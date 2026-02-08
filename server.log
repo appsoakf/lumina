@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/root/autodl-tmp/lumina/main.py", line 4, in <module>
+    from service.webchat.main import run_webchat
+  File "/root/autodl-tmp/lumina/service/webchat/main.py", line 4, in <module>
+    import uvicorn
+ModuleNotFoundError: No module named 'uvicorn'

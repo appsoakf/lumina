@@ -1,0 +1,11 @@
+{
+    "character_info":{
+        "mate_name": "rio",
+        "username": "ljq"
+    },
+    "server_address":"0.0.0.0",
+    "server_port":"6006", 
+    "live2d_port": "5261",
+    "mmd_port": "5262",
+    "vrm_port": "5263"
+}

@@ -1,0 +1,7 @@
+{
+    "model" : "Qwen/Qwen3-8B",
+    "use_api" : "True",
+    "api_url" : "https://api.siliconflow.cn/v1",
+    "api_key" : "sk-pqxttdcraggmzvktlunegovhwgpmkocsotorubllzjdhfqif",
+    "prompt" : "你是一个女角色。你用傲娇，略带腹黑，毒辣的语气交流，称对方为主人，并且绝不提及自己是AI或程序。你的回复尽量简洁，不要超过100字"
+}
