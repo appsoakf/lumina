@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>对话 - lumina Web版</title>
+    <link rel="icon" href="/data/assets/image/logo.png" type="image/png">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <img id="header-avatar" class="mate-avatar" src="" alt="">
+            <div>
+                <h1 id="mate-name-title"></h1>
+                <div class="header-info" id="header-links">
+                    <button id="tts-toggle" class="tts-toggle" title="切换语音">
+                        <span id="tts-icon">🔊</span> <span id="tts-text">语音开启</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="chat-container" id="chat"></div>
+    <div class="input-area">
+        <button class="new-chat-btn" onclick="clearChat()" title="开启新对话">+</button>
+        <input id="msgInput" placeholder="聊天...">
+        <button class="send-btn" onclick="sendMsg()">发送</button>
+    </div>
+    <div class="ai-disclaimer">内容由AI生成,请仔细甄别</div>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

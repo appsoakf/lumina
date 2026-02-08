@@ -24,9 +24,9 @@ class TTSEngine:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
         self.base_url = config["GPT-SoVITS_url"]
-        self.default_ref_path = config["ref_audios/sample.wav"]
-        self.default_prompt_text = config["カフェインはカプセルで摂取すれば良いのではないかしら？"]
-        self.default_prompt_lang = config["ja"]
+        self.default_ref_path = config["ref_path"]
+        self.default_prompt_text = config["prompt_text"]
+        self.default_prompt_lang = config["prompt_lang"]
 
     async def synthesize(self, request: TTSRequest) -> Dict[str, Any]:
         """
