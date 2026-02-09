@@ -3,6 +3,8 @@ let ws = null;
 let isProcessing = false;
 let currentBotMessageElement = null;
 let ttsEnabled = localStorage.getItem('ttsEnabled') !== 'false'; // 默认开启
+let audioQueue = [];
+let isPlayingAudio = false;
 
 async function initApp() {
     try {
@@ -59,6 +61,8 @@ function initWebSocket() {
                 isProcessing = true;
                 disableInput();
             } else if (data.type === "stream_start") {
+                audioQueue = [];
+                isPlayingAudio = false;
                 currentBotMessageElement = addMessage(data.sender, "");
                 const textDiv = currentBotMessageElement.querySelector(".message-content div:last-of-type");
                 if(textDiv) textDiv.classList.add("text-streaming");
@@ -88,14 +92,13 @@ function initWebSocket() {
                 } else {
                     addMessage(config.mate_name, errorText);
                 }
-            } else if (data.type === "audio") {
-                // 播放音频
-                try {
-                    const audio = new Audio("data:audio/wav;base64," + data.data);
-                    audio.play().catch(e => console.error("Audio play error:", e));
-                } catch (e) {
-                    console.error("Audio processing error:", e);
+            } else if (data.type === "audio_chunk") {
+                audioQueue.push(data.data);
+                if (!isPlayingAudio) {
+                    playNextAudioChunk();
                 }
+            } else if (data.type === "audio_done") {
+                // 所有音频片段已发送，队列会自然排空
             } else if (data.type === "done") {
                 isProcessing = false;
                 enableInput();
@@ -160,6 +163,32 @@ function setupTTSToggle() {
             currentText.textContent = '语音关闭';
             currentBtn.classList.add('disabled');
         }
+    }
+}
+
+function playNextAudioChunk() {
+    if (audioQueue.length === 0) {
+        isPlayingAudio = false;
+        return;
+    }
+    isPlayingAudio = true;
+    const audioData = audioQueue.shift();
+    try {
+        const audio = new Audio("data:audio/wav;base64," + audioData);
+        audio.onended = function() {
+            playNextAudioChunk();
+        };
+        audio.onerror = function(e) {
+            console.error("Audio playback error:", e);
+            playNextAudioChunk();
+        };
+        audio.play().catch(e => {
+            console.error("Audio play error:", e);
+            playNextAudioChunk();
+        });
+    } catch (e) {
+        console.error("Audio processing error:", e);
+        playNextAudioChunk();
     }
 }
 
