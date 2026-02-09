@@ -1,6 +1,7 @@
 import httpx
 import os
 import json
+import time
 import logging
 from typing import Optional, Dict, Any, AsyncGenerator
 from pydantic import BaseModel
@@ -37,9 +38,15 @@ class TTSEngine:
             self._client = httpx.AsyncClient(timeout=180.0)
         return self._client
 
-    def _build_payload(self, request: TTSRequest, streaming: bool = False) -> dict:
-        """构建 TTS API 请求参数。"""
-        return {
+    async def synthesize(self, request: TTSRequest, request_id: str = None) -> Dict[str, Any]:
+        """
+        异步合成 TTS，返回音频字节或流式生成器。
+        :return: {"success": bool, "audio_bytes": bytes or AsyncGenerator, "error": str}
+        """
+        req_id = request_id or "unknown"
+        t_start = time.time()
+
+        payload = {
             "text": request.text,
             "text_lang": request.text_lang,
             "ref_audio_path": request.ref_audio_path or self.default_ref_path,
@@ -52,27 +59,24 @@ class TTSEngine:
             "batch_size": request.batch_size,
             "text_split_method": "cut5",
             "media_type": "wav",
-            "streaming_mode": streaming,
+            "streaming_mode": request.streaming,
             "parallel_infer": True,
         }
 
-    async def synthesize(self, request: TTSRequest, request_id: str = None) -> Dict[str, Any]:
-        """
-        异步合成 TTS，返回音频字节或流式生成器。
-        :return: {"success": bool, "audio_bytes": bytes or AsyncGenerator, "error": str}
-        """
-        req_id = request_id or "unknown"
-        payload = self._build_payload(request, streaming=request.streaming)
-
-        logger.info(f"[{req_id}] TTS request | text_len={len(request.text)}")
+        logger.info(f"[{req_id}] [TTS] http_request_sending | text_len={len(request.text)}")
 
         client = await self._get_client()
         try:
+            t_request = time.time()
             resp = await client.post(f"{self.base_url}/tts", json=payload)
+            t_response = time.time()
+
+            elapsed_request = (t_response - t_request) * 1000
+            logger.info(f"[{req_id}] [TTS] http_response_received | status={resp.status_code} | elapsed={elapsed_request:.2f}ms")
 
             if resp.status_code != 200:
                 error = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
-                logger.error(f"[{req_id}] TTS error: API {resp.status_code} - {error}")
+                logger.error(f"[{req_id}] [TTS] api_error | status={resp.status_code} | error={error}")
                 return {"success": False, "error": f"API 错误 ({resp.status_code}): {error}"}
 
             if request.streaming:
@@ -82,35 +86,16 @@ class TTSEngine:
                             yield chunk
                 return {"success": True, "audio_stream": audio_stream()}
             else:
-                logger.info(f"[{req_id}] TTS completed | audio_size={len(resp.content)}")
+                audio_size = len(resp.content)
+                total_elapsed = (time.time() - t_start) * 1000
+                logger.info(f"[{req_id}] [TTS] audio_received | audio_size={audio_size} | total_elapsed={total_elapsed:.2f}ms")
                 return {"success": True, "audio_bytes": resp.content}
 
         except httpx.RequestError as e:
-            logger.error(f"[{req_id}] TTS error: connection failed - {e}")
+            elapsed_error = (time.time() - t_start) * 1000
+            logger.error(f"[{req_id}] [TTS] connection_error | elapsed={elapsed_error:.2f}ms | error={str(e)}")
             return {"success": False, "error": f"连接失败: {str(e)}"}
         except Exception as e:
-            logger.error(f"[{req_id}] TTS error: {e}")
+            elapsed_error = (time.time() - t_start) * 1000
+            logger.error(f"[{req_id}] [TTS] synthesis_error | elapsed={elapsed_error:.2f}ms | error={str(e)}")
             return {"success": False, "error": f"合成异常: {str(e)}"}
-
-    async def synthesize_streaming(self, request: TTSRequest, request_id: str = None):
-        """流式合成 TTS，返回 async generator 逐块 yield 音频字节。"""
-        req_id = request_id or "unknown"
-        payload = self._build_payload(request, streaming=True)
-
-        logger.info(f"[{req_id}] TTS streaming request | text_len={len(request.text)}")
-
-        client = await self._get_client()
-
-        async def audio_stream():
-            try:
-                async with client.stream("POST", f"{self.base_url}/tts", json=payload) as resp:
-                    if resp.status_code != 200:
-                        logger.error(f"[{req_id}] TTS streaming error: API {resp.status_code}")
-                        return
-                    async for chunk in resp.aiter_bytes(chunk_size=None):
-                        if chunk:
-                            yield chunk
-            except Exception as e:
-                logger.error(f"[{req_id}] TTS streaming error: {e}")
-
-        return {"success": True, "audio_stream": audio_stream()}

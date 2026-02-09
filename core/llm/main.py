@@ -1,7 +1,10 @@
 import json
 import os
+import logging
 from openai import OpenAI
 from typing import Generator
+
+logger = logging.getLogger(__name__)
 class LLMEngine:
     def __init__(self):
         config_path = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -26,23 +29,25 @@ class LLMEngine:
         except Exception as e:
             return f"本地llm模块generate出错，错误详情：{e}"
         
-    def generate_by_api_stream(self, msg) -> Generator:
+    def generate_by_api_stream(self, msg: str, request_id: str = None) -> Generator:
         try:
-            self.conversation_history.append({"role":"user", "content": msg})
+            self.conversation_history.append({"role": "user", "content": msg})
             messages = [{"role": "system", "content": self.prompt}]
-            # 将当前的prompt + 之前所有的对话作为llm的输入
             messages.extend(self.conversation_history)
-            stream_response = self.client.chat.completions.create(model=self.model, messages=messages, stream=True)
+
+            stream_response = self.client.chat.completions.create(
+                model=self.model, messages=messages, stream=True
+            )
 
             for chunk in stream_response:
                 if chunk.choices and chunk.choices[0].delta.content is not None:
-                    delta = chunk.choices[0].delta.content
-                    yield delta
+                    yield chunk.choices[0].delta.content
 
         except Exception as e:
-            yield f"本地llm模块generate_stream出错，错误详情：{e}"
+            req_id = request_id or "unknown"
+            logger.error(f"[{req_id}] LLM stream error: {e}")
+            yield f"LLM生成出错：{e}"
 
 
     def append_history(self, role: str, msg: str):
-        self.conversation_history.append({"role":role, "content": msg})
-    # def generate_by_localllm(self, prompt):
+        self.conversation_history.append({"role": role, "content": msg})
