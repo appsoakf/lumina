@@ -39,6 +39,8 @@ response = llm.generate_by_api("你好")
 # 流式
 for chunk in llm.generate_by_api_stream("你好"):
     print(chunk, end="")
+# 翻译（独立调用，不影响对话历史）
+ja_text = llm.translate("你好")
 ```
 
 ### TTSEngine (`core/tts/main.py`)
@@ -55,15 +57,15 @@ result = await tts.synthesize(req)
 ## 数据流
 
 ```
-用户输入 → WebSocket → LLM流式生成 → 文本分句 → TTS合成 → 音频播放
-                         ↓
-                    实时文本显示
+用户输入 → WebSocket → LLM流式生成(中文) → 实时文本显示
+                                ↓ (流结束后)
+                         LLM翻译(中→日) → TTS合成 → 音频播放
 ```
 
 1. 前端通过 WebSocket 发送用户消息
-2. 后端调用 LLM 流式生成回复，实时推送文本
-3. 检测到完整句子后，异步提交 TTS 合成
-4. 音频按句子顺序发送到前端播放
+2. 后端调用 LLM 流式生成纯中文回复，实时推送文本到前端
+3. 流结束后，若 TTS 开启，调用 `llm.translate()` 将中文翻译为日文
+4. 将日文发送给 TTS 合成音频，返回前端播放
 
 ## 运行
 
@@ -79,7 +81,8 @@ python main.py
 - `api_url`: OpenAI 兼容 API 地址
 - `api_key`: API 密钥
 - `model`: 模型名称
-- `prompt`: 系统提示词
+- `prompt`: 聊天系统提示词（只输出中文）
+- `translate_prompt`: 翻译提示词（中文→日文，供 TTS 使用）
 
 ### TTS (`core/tts/config.json`)
 - `GPT-SoVITS_url`: TTS 服务地址

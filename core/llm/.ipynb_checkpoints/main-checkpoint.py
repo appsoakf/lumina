@@ -53,22 +53,6 @@ class LLMEngine:
     def append_history(self, role: str, msg: str):
         self.conversation_history.append({"role": role, "content": msg})
 
-    def translate_stream(self, text: str, request_id: str = None) -> Generator:
-        """将中文流式翻译为日文，yields chunks。不影响对话历史。"""
-        try:
-            messages = [
-                {"role": "system", "content": self.translate_prompt},
-                {"role": "user", "content": text}
-            ]
-            stream_response = self.client.chat.completions.create(
-                model=self.model, messages=messages, stream=True
-            )
-            for chunk in stream_response:
-                if chunk.choices and chunk.choices[0].delta.content is not None:
-                    yield chunk.choices[0].delta.content
-        except Exception as e:
-            logger.error(f"[{request_id or 'unknown'}] Translation stream error: {e}")
-
     def translate(self, text: str) -> str:
         """将中文翻译为日文，不影响对话历史。"""
         try:

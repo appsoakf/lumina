@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class TTSRequest(BaseModel):
     text: str
-    text_lang: str = "zh"
+    text_lang: str = "ja"
     ref_audio_path: Optional[str] = None
     prompt_text: Optional[str] = None
     prompt_lang: Optional[str] = None
@@ -64,8 +64,6 @@ class TTSEngine:
         req_id = request_id or "unknown"
         payload = self._build_payload(request, streaming=request.streaming)
 
-        logger.info(f"[{req_id}] TTS request | text_len={len(request.text)}")
-
         client = await self._get_client()
         try:
             resp = await client.post(f"{self.base_url}/tts", json=payload)
@@ -82,7 +80,6 @@ class TTSEngine:
                             yield chunk
                 return {"success": True, "audio_stream": audio_stream()}
             else:
-                logger.info(f"[{req_id}] TTS completed | audio_size={len(resp.content)}")
                 return {"success": True, "audio_bytes": resp.content}
 
         except httpx.RequestError as e:
@@ -96,8 +93,6 @@ class TTSEngine:
         """流式合成 TTS，返回 async generator 逐块 yield 音频字节。"""
         req_id = request_id or "unknown"
         payload = self._build_payload(request, streaming=True)
-
-        logger.info(f"[{req_id}] TTS streaming request | text_len={len(request.text)}")
 
         client = await self._get_client()
 

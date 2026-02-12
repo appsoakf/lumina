@@ -238,7 +238,7 @@ function sendMsg() {
         action: "send",
         text: text,
         tts_enabled: ttsEnabled,
-        tts_mode: 3
+        tts_mode: 2
     }));
     input.value = "";
 }
