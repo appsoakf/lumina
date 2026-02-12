@@ -5,6 +5,37 @@ let currentBotMessageElement = null;
 let ttsEnabled = localStorage.getItem('ttsEnabled') !== 'false'; // 默认开启
 let audioQueue = [];
 let isPlayingAudio = false;
+let firstAudioReceiveTime = null;  // 记录第一个音频chunk到达时间
+let firstAudioPlayed = false;      // 标记第一个音频是否已开始播放
+let debugMode = true;              // 调试模式开关
+let audioWarmedUp = false;
+
+function ensureAudioReady() {
+    if (audioWarmedUp) return;
+    audioWarmedUp = true;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+    // 播放静音 WAV 预热浏览器音频管线
+    const silence = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+    const a = new Audio(silence);
+    a.volume = 0;
+    a.play().then(() => a.remove()).catch(() => {});
+}
+
+function debugLog(msg) {
+    if (!debugMode) return;
+    console.log(msg);
+    // 输出到对话界面
+    const chat = document.getElementById("chat");
+    if (chat) {
+        const debugDiv = document.createElement("div");
+        debugDiv.className = "message";
+        debugDiv.style.cssText = "background:#fffbe6;padding:4px 8px;margin:2px 0;font-size:12px;color:#666;font-family:monospace;";
+        debugDiv.textContent = `[DEBUG] ${msg}`;
+        chat.appendChild(debugDiv);
+        scrollToBottom();
+    }
+}
 
 // 打字机效果相关变量
 let textBuffer = "";
@@ -89,6 +120,8 @@ function initWebSocket() {
             } else if (data.type === "stream_start") {
                 audioQueue = [];
                 isPlayingAudio = false;
+                firstAudioReceiveTime = null;
+                firstAudioPlayed = false;
                 textBuffer = "";
                 if (typingTimer) {
                     clearTimeout(typingTimer);
@@ -130,7 +163,12 @@ function initWebSocket() {
                     addMessage(config.mate_name, errorText);
                 }
             } else if (data.type === "audio_chunk") {
-                audioQueue.push(data.data);
+                const receiveTime = performance.now();
+                if (!firstAudioReceiveTime) {
+                    firstAudioReceiveTime = receiveTime;
+                    debugLog(`First audio chunk received | size=${data.data.length} chars`);
+                }
+                audioQueue.push({ data: data.data, receiveTime: receiveTime });
                 if (!isPlayingAudio) {
                     playNextAudioChunk();
                 }
@@ -209,28 +247,58 @@ function playNextAudioChunk() {
         return;
     }
     isPlayingAudio = true;
-    const audioData = audioQueue.shift();
+    const audioItem = audioQueue.shift();
+    const audioData = audioItem.data;
+    const chunkReceiveTime = audioItem.receiveTime;
+
     try {
-        const audio = new Audio("data:audio/wav;base64," + audioData);
+        const decodeStart = performance.now();
+        const binary = atob(audioData);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        const decodeEnd = performance.now();
+
+        audio.oncanplaythrough = function() {
+            const canPlayTime = performance.now();
+            if (!firstAudioPlayed) {
+                debugLog(`canplaythrough | decode=${(decodeEnd - decodeStart).toFixed(1)}ms | wait=${(canPlayTime - decodeEnd).toFixed(1)}ms`);
+            }
+        };
+
         audio.onended = function() {
+            URL.revokeObjectURL(url);
             playNextAudioChunk();
         };
         audio.onerror = function(e) {
-            console.error("Audio playback error:", e);
+            URL.revokeObjectURL(url);
+            debugLog(`Audio error: ${e.type}`);
             playNextAudioChunk();
         };
-        audio.play().catch(e => {
-            console.error("Audio play error:", e);
+
+        const playStart = performance.now();
+        audio.play().then(() => {
+            const playTime = performance.now();
+            if (!firstAudioPlayed) {
+                firstAudioPlayed = true;
+                const totalLatency = playTime - firstAudioReceiveTime;
+                debugLog(`play() resolved | call=${(playTime - playStart).toFixed(1)}ms | total_frontend=${totalLatency.toFixed(1)}ms`);
+            }
+        }).catch(e => {
+            debugLog(`play() error: ${e.message}`);
             playNextAudioChunk();
         });
     } catch (e) {
-        console.error("Audio processing error:", e);
+        debugLog(`Audio exception: ${e.message}`);
         playNextAudioChunk();
     }
 }
 
 function sendMsg() {
     if (isProcessing) return;
+    ensureAudioReady();
     const input = document.getElementById("msgInput");
     const text = input.value.trim();
     if (!text) return;
@@ -238,7 +306,7 @@ function sendMsg() {
         action: "send",
         text: text,
         tts_enabled: ttsEnabled,
-        tts_mode: 3
+        tts_mode: 1
     }));
     input.value = "";
 }

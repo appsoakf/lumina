@@ -67,6 +67,19 @@ result = await tts.synthesize(req)
 3. 流结束后，若 TTS 开启，调用 `llm.translate()` 将中文翻译为日文
 4. 将日文发送给 TTS 合成音频，返回前端播放
 
+## TTS 模式
+
+前端通过 `tts_mode` 参数选择 TTS 处理方案：
+
+| 模式 | 说明 | 延迟特点 |
+|------|------|----------|
+| 1 | LLM 边生成边分句，每句独立翻译+TTS | N 次翻译调用 |
+| 2 | 整段流式翻译 → 日文分句 → 串行 TTS | 1 次翻译 |
+| 3 | 整段流式翻译 + Queue 解耦 + 日文分句 TTS 并行 | 翻译与 TTS 并行 |
+| 4 | 整段流式翻译 + Queue 解耦 + 流式 TTS | 首段音频延迟最低 |
+
+v4 使用 `tts.synthesize_streaming()` 流式获取音频 chunk，边合成边发送，首段音频到达时间比 v3 更快。
+
 ## 运行
 
 ```bash

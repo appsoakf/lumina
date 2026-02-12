@@ -2,7 +2,7 @@ import httpx
 import os
 import json
 import logging
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,6 @@ class TTSRequest(BaseModel):
     top_p: float = 1.0
     speed_factor: float = 1.0
     batch_size: int = 1
-    streaming: bool = False
 
 class TTSEngine:
     def __init__(self, base_url: str = None):
@@ -37,7 +36,7 @@ class TTSEngine:
             self._client = httpx.AsyncClient(timeout=180.0)
         return self._client
 
-    def _build_payload(self, request: TTSRequest, streaming: bool = False) -> dict:
+    def _build_payload(self, request: TTSRequest) -> dict:
         """构建 TTS API 请求参数。"""
         return {
             "text": request.text,
@@ -52,17 +51,14 @@ class TTSEngine:
             "batch_size": request.batch_size,
             "text_split_method": "cut5",
             "media_type": "wav",
-            "streaming_mode": streaming,
             "parallel_infer": True,
         }
 
     async def synthesize(self, request: TTSRequest, request_id: str = None) -> Dict[str, Any]:
-        """
-        异步合成 TTS，返回音频字节或流式生成器。
-        :return: {"success": bool, "audio_bytes": bytes or AsyncGenerator, "error": str}
-        """
+        """非流式合成 TTS，返回完整音频字节。"""
         req_id = request_id or "unknown"
-        payload = self._build_payload(request, streaming=request.streaming)
+        payload = self._build_payload(request)
+        payload["streaming_mode"] = False
 
         client = await self._get_client()
         try:
@@ -73,14 +69,7 @@ class TTSEngine:
                 logger.error(f"[{req_id}] TTS error: API {resp.status_code} - {error}")
                 return {"success": False, "error": f"API 错误 ({resp.status_code}): {error}"}
 
-            if request.streaming:
-                async def audio_stream() -> AsyncGenerator[bytes, None]:
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            yield chunk
-                return {"success": True, "audio_stream": audio_stream()}
-            else:
-                return {"success": True, "audio_bytes": resp.content}
+            return {"success": True, "audio_bytes": resp.content}
 
         except httpx.RequestError as e:
             logger.error(f"[{req_id}] TTS error: connection failed - {e}")
@@ -90,22 +79,31 @@ class TTSEngine:
             return {"success": False, "error": f"合成异常: {str(e)}"}
 
     async def synthesize_streaming(self, request: TTSRequest, request_id: str = None):
-        """流式合成 TTS，返回 async generator 逐块 yield 音频字节。"""
+        """流式合成 TTS，立即建连并验证状态码，返回 async generator 逐块 yield 音频字节。"""
         req_id = request_id or "unknown"
-        payload = self._build_payload(request, streaming=True)
+        payload = self._build_payload(request)
+        payload["streaming_mode"] = True
 
         client = await self._get_client()
 
+        try:
+            resp_ctx = client.stream("POST", f"{self.base_url}/tts", json=payload)
+            resp = await resp_ctx.__aenter__()
+            if resp.status_code != 200:
+                await resp_ctx.__aexit__(None, None, None)
+                return {"success": False, "error": f"API 错误 ({resp.status_code})"}
+        except Exception as e:
+            logger.error(f"[{req_id}] TTS streaming connection error: {e}")
+            return {"success": False, "error": str(e)}
+
         async def audio_stream():
             try:
-                async with client.stream("POST", f"{self.base_url}/tts", json=payload) as resp:
-                    if resp.status_code != 200:
-                        logger.error(f"[{req_id}] TTS streaming error: API {resp.status_code}")
-                        return
-                    async for chunk in resp.aiter_bytes(chunk_size=None):
-                        if chunk:
-                            yield chunk
+                async for chunk in resp.aiter_bytes(chunk_size=None):
+                    if chunk:
+                        yield chunk
             except Exception as e:
-                logger.error(f"[{req_id}] TTS streaming error: {e}")
+                logger.error(f"[{req_id}] TTS streaming iteration error: {e}")
+            finally:
+                await resp_ctx.__aexit__(None, None, None)
 
         return {"success": True, "audio_stream": audio_stream()}

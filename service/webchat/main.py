@@ -21,6 +21,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 禁用 uvicorn access log
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# 对话轮数计数器
+conversation_round = 0
+
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -40,7 +48,7 @@ async def warmup_tts():
     """服务启动时预热 TTS，避免首次请求冷启动延迟。"""
     logger.info("[WARMUP] Sending TTS warmup request...")
     try:
-        req = TTSRequest(text="你好", streaming=False)
+        req = TTSRequest(text="你好")
         result = await tts.synthesize(req, request_id="warmup")
         if result.get("success"):
             logger.info("[WARMUP] TTS warmup completed successfully")
@@ -113,12 +121,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 web_chat_history.append(new_msg)
                 await manager.send({"type": "message", "data": new_msg})
                 await manager.send({"type": "processing"})
-                if tts_mode == 3:
-                    asyncio.create_task(handle_bot_reply_stream_v3(user_text, tts_enabled))
-                elif tts_mode == 2:
-                    asyncio.create_task(handle_bot_reply_stream_v2(user_text, tts_enabled))
-                else:
-                    asyncio.create_task(handle_bot_reply_stream(user_text, tts_enabled))
+                asyncio.create_task(handle_bot_reply(user_text, tts_enabled, tts_mode))
             elif action == "clear":
                 web_chat_history.clear()
                 await manager.send({"type": "clear"})
@@ -149,7 +152,7 @@ async def iterate_in_thread(sync_iterable):
 async def synthesize_sentence(sentence: str, request_id: str = None) -> str | None:
     """对单个句子调用 TTS，返回 base64 音频字符串，失败返回 None。"""
     try:
-        tts_req = TTSRequest(text=sentence, streaming=False)
+        tts_req = TTSRequest(text=sentence)
         result = await tts.synthesize(tts_req, request_id=request_id)
         if result.get("success"):
             audio_data = result.get("audio_bytes")
@@ -173,239 +176,313 @@ def split_sentences(text: str) -> tuple[list[str], str]:
     return sentences, parts[-1]
 
 
-async def _tts_consumer(queue: asyncio.Queue, request_id: str):
-    """从队列顺序取句子，翻译→TTS合成→发送音频。收到 None 哨兵时退出。"""
+async def _stream_llm(user_text: str, request_id: str, round_num: int,
+                      start_time: float, on_chunk=None):
+    """LLM 流式生成阶段，返回 full_reply。
+    on_chunk: 可选回调，v1 模式用于实时分句入队。"""
+    full_reply = ""
+
+    async for chunk in iterate_in_thread(
+        llm.generate_by_api_stream(user_text, request_id=request_id)
+    ):
+        if not chunk:
+            continue
+        full_reply += chunk
+        await manager.send({"type": "stream_chunk", "data": chunk})
+        if on_chunk:
+            await on_chunk(chunk)
+
+    await manager.send({"type": "stream_done"})
+
+    web_chat_history.append({"sender": mate_name, "text": full_reply})
+    llm.append_history("assistant", full_reply)
+
+    return full_reply
+
+
+async def _translate_and_enqueue(full_reply: str, request_id: str, round_num: int,
+                                 tts_queue: asyncio.Queue):
+    """流式翻译中文→日文，分句后入队，最后发送哨兵。"""
+    ja_buffer = ""
+    async for ja_chunk in iterate_in_thread(
+        llm.translate_stream(full_reply, request_id=request_id)
+    ):
+        if not ja_chunk:
+            continue
+        ja_buffer += ja_chunk
+        sentences, ja_buffer = split_sentences(ja_buffer)
+        for s in sentences:
+            await tts_queue.put(s)
+
+    if ja_buffer.strip():
+        await tts_queue.put(ja_buffer)
+
+    await tts_queue.put(None)  # 哨兵
+
+
+
+async def _tts_consumer(queue: asyncio.Queue, request_id: str, mode: int,
+                        llm_done_time: float, round_num: int,
+                        start_time: float):
+    """统一 TTS consumer。mode=1: 中文→翻译→TTS; mode=3: 日文→TTS; mode=4: 日文→流式TTS。"""
     loop = asyncio.get_running_loop()
     index = 0
+    first_audio_sent = False
+
     while True:
         sentence = await queue.get()
         if sentence is None:
             break
         try:
-            logger.info(f"[{request_id}] Translating sentence {index}: {sentence[:30]}...")
-            ja_text = await loop.run_in_executor(None, llm.translate, sentence)
-            if ja_text:
-                logger.info(f"[{request_id}] Sentence {index} translated: {ja_text[:30]}...")
-                audio_base64 = await synthesize_sentence(ja_text, request_id=request_id)
-                if audio_base64:
-                    await manager.send({"type": "audio_chunk", "data": audio_base64, "index": index})
+            tts_start = time.time()
+
+            if mode == 1:
+                # v1: 中文句子 → 翻译 → 流式 TTS
+                translate_start = time.time()
+                ja_text = await loop.run_in_executor(None, llm.translate, sentence)
+                if not ja_text:
+                    continue
+                translate_end = time.time()
+
+                tts_req = TTSRequest(text=ja_text)
+                result = await tts.synthesize_streaming(tts_req, request_id=request_id)
+                if result.get("success"):
+                    audio_stream = result.get("audio_stream")
+                    wav_buf = bytearray()
+                    async for audio_chunk in audio_stream:
+                        if not audio_chunk:
+                            continue
+                        wav_buf.extend(audio_chunk)
+                        # GPT-SoVITS 流式返回多段拼接 WAV，按 RIFF 头切分
+                        while True:
+                            riff_pos = wav_buf.find(b'RIFF', 4) if len(wav_buf) > 4 else -1
+                            if riff_pos == -1:
+                                break
+                            complete_wav = bytes(wav_buf[:riff_pos])
+                            wav_buf = wav_buf[riff_pos:]
+                            audio_b64 = base64.b64encode(complete_wav).decode('utf-8')
+                            await manager.send({"type": "audio_chunk", "data": audio_b64, "index": index})
+                            if not first_audio_sent:
+                                now = time.time()
+                                first_sentence_ready = tts_start - start_time
+                                translate_latency = translate_end - translate_start
+                                first_tts_latency = now - translate_end
+                                request_to_first_audio = now - start_time
+                                logger.info(
+                                    f"[Round {round_num}][{request_id}] First audio sent"
+                                    f" | request_to_first_audio={request_to_first_audio:.3f}s"
+                                    f" (first_sentence_ready={first_sentence_ready:.3f}s"
+                                    f" + translate={translate_latency:.3f}s"
+                                    f" + tts={first_tts_latency:.3f}s)"
+                                )
+                                first_audio_sent = True
+                    # flush remaining buffer as the last WAV segment
+                    if wav_buf:
+                        audio_b64 = base64.b64encode(bytes(wav_buf)).decode('utf-8')
+                        await manager.send({"type": "audio_chunk", "data": audio_b64, "index": index})
+                        if not first_audio_sent:
+                            now = time.time()
+                            first_sentence_ready = tts_start - start_time
+                            translate_latency = translate_end - translate_start
+                            first_tts_latency = now - translate_end
+                            request_to_first_audio = now - start_time
+                            logger.info(
+                                f"[Round {round_num}][{request_id}] First audio sent"
+                                f" | request_to_first_audio={request_to_first_audio:.3f}s"
+                                f" (first_sentence_ready={first_sentence_ready:.3f}s"
+                                f" + translate={translate_latency:.3f}s"
+                                f" + tts={first_tts_latency:.3f}s)"
+                            )
+                            first_audio_sent = True
                     index += 1
+                else:
+                    logger.error(f"[Round {round_num}][{request_id}] TTS streaming failed: {result.get('error')}")
+
+            elif mode == 3:
+                # v3: 日文句子 → 非流式 TTS
+                audio_base64 = await synthesize_sentence(sentence, request_id=request_id)
+                if audio_base64:
+                    tts_latency = time.time() - tts_start
+                    await manager.send({"type": "audio_chunk", "data": audio_base64, "index": index})
+                    if not first_audio_sent:
+                        now = time.time()
+                        llm_latency = llm_done_time - start_time
+                        translate_to_first_sentence = tts_start - llm_done_time
+                        request_to_first_audio = now - start_time
+                        logger.info(
+                            f"[Round {round_num}][{request_id}] First audio sent"
+                            f" | request_to_first_audio={request_to_first_audio:.3f}s"
+                            f" (llm={llm_latency:.3f}s"
+                            f" + translate_to_first_sentence={translate_to_first_sentence:.3f}s"
+                            f" + tts={tts_latency:.3f}s)"
+                        )
+                        first_audio_sent = True
+                    index += 1
+
+            elif mode == 4:
+                # v4: 日文句子 → 流式 TTS
+                tts_req = TTSRequest(text=sentence)
+                result = await tts.synthesize_streaming(tts_req, request_id=request_id)
+                if result.get("success"):
+                    audio_stream = result.get("audio_stream")
+                    wav_buf = bytearray()
+                    async for audio_chunk in audio_stream:
+                        if not audio_chunk:
+                            continue
+                        wav_buf.extend(audio_chunk)
+                        # GPT-SoVITS 流式返回多段拼接 WAV，按 RIFF 头切分
+                        while True:
+                            riff_pos = wav_buf.find(b'RIFF', 4) if len(wav_buf) > 4 else -1
+                            if riff_pos == -1:
+                                break
+                            complete_wav = bytes(wav_buf[:riff_pos])
+                            wav_buf = wav_buf[riff_pos:]
+                            audio_b64 = base64.b64encode(complete_wav).decode('utf-8')
+                            await manager.send({"type": "audio_chunk", "data": audio_b64, "index": index})
+                            if not first_audio_sent:
+                                now = time.time()
+                                llm_latency = llm_done_time - start_time
+                                translate_to_first_sentence = tts_start - llm_done_time
+                                first_tts_latency = now - tts_start
+                                request_to_first_audio = now - start_time
+                                logger.info(
+                                    f"[Round {round_num}][{request_id}] First audio sent"
+                                    f" | request_to_first_audio={request_to_first_audio:.3f}s"
+                                    f" (llm={llm_latency:.3f}s"
+                                    f" + translate_to_first_sentence={translate_to_first_sentence:.3f}s"
+                                    f" + tts={first_tts_latency:.3f}s)"
+                                )
+                                first_audio_sent = True
+                    # flush remaining buffer as the last WAV segment
+                    if wav_buf:
+                        audio_b64 = base64.b64encode(bytes(wav_buf)).decode('utf-8')
+                        await manager.send({"type": "audio_chunk", "data": audio_b64, "index": index})
+                        if not first_audio_sent:
+                            now = time.time()
+                            llm_latency = llm_done_time - start_time
+                            translate_to_first_sentence = tts_start - llm_done_time
+                            first_tts_latency = now - tts_start
+                            request_to_first_audio = now - start_time
+                            logger.info(
+                                f"[Round {round_num}][{request_id}] First audio sent"
+                                f" | request_to_first_audio={request_to_first_audio:.3f}s"
+                                f" (llm={llm_latency:.3f}s"
+                                f" + translate_to_first_sentence={translate_to_first_sentence:.3f}s"
+                                f" + tts={first_tts_latency:.3f}s)"
+                            )
+                            first_audio_sent = True
+                    index += 1
+                else:
+                    logger.error(f"[Round {round_num}][{request_id}] TTS streaming failed: {result.get('error')}")
+
         except Exception as e:
-            logger.error(f"[{request_id}] TTS consumer error on sentence {index}: {e}")
+            logger.error(f"[Round {round_num}][{request_id}] TTS consumer error on sentence {index}: {e}")
 
 
-async def handle_bot_reply_stream(user_text: str, tts_enabled: bool = True):
+
+async def handle_bot_reply(user_text: str, tts_enabled: bool, tts_mode: int):
+    """统一入口，替代 4 个独立 handler。"""
+    global conversation_round
+    conversation_round += 1
+    round_num = conversation_round
+
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
-    full_reply = ""  # 完整中文回复
-    buffer = ""      # 未切分的文本缓冲
 
+    logger.info(f"[Round {round_num}][{request_id}] Start processing | mode=v{tts_mode} | tts_enabled={tts_enabled}")
     await manager.send({"type": "stream_start", "sender": mate_name})
 
-    # 如果 TTS 开启，启动消费者协程
-    tts_queue: asyncio.Queue | None = None
     consumer_task: asyncio.Task | None = None
-    if tts_enabled:
-        tts_queue = asyncio.Queue()
-        consumer_task = asyncio.create_task(_tts_consumer(tts_queue, request_id))
 
     try:
-        # 流式获取 LLM 中文回复
-        async for chunk in iterate_in_thread(llm.generate_by_api_stream(user_text, request_id=request_id)):
-            if not chunk:
-                continue
-            full_reply += chunk
-            await manager.send({"type": "stream_chunk", "data": chunk})
+        # --- Phase 1: LLM 流式生成 ---
+        if tts_mode == 1 and tts_enabled:
+            # v1 特殊：LLM 生成期间实时分句入队（中文句子）
+            tts_queue = asyncio.Queue()
+            consumer_task = asyncio.create_task(
+                _tts_consumer(tts_queue, request_id, mode=1,
+                              llm_done_time=start_time, round_num=round_num,
+                              start_time=start_time)
+            )
+            buffer = ""
 
-            # 分句：将完整句子送入 TTS 队列
-            if tts_queue is not None:
+            async def _on_chunk(chunk):
+                nonlocal buffer
                 buffer += chunk
                 sentences, buffer = split_sentences(buffer)
                 for s in sentences:
                     await tts_queue.put(s)
 
-        await manager.send({"type": "stream_done"})
-        llm_latency = time.time() - start_time
-        logger.info(f"[{request_id}] LLM completed | latency={llm_latency:.3f}s | text={full_reply[:50]}...")
-
-        # 保存聊天历史
-        web_chat_history.append({"sender": mate_name, "text": full_reply})
-        llm.append_history("assistant", full_reply)
-
-        # flush 剩余 buffer 作为最后一句
-        if tts_queue is not None:
-            if buffer.strip():
-                await tts_queue.put(buffer)
-            await tts_queue.put(None)  # 哨兵，通知消费者退出
-            await consumer_task
-            await manager.send({"type": "audio_done"})
-
-    except Exception as e:
-        logger.error(f"[{request_id}] stream error: {e}")
-        await manager.send({"type": "stream_error", "text": f"\n（生成出错：{str(e)}）"})
-        await manager.send({"type": "stream_done"})
-        if consumer_task is not None:
-            consumer_task.cancel()
-
-    finally:
-        total_latency = time.time() - start_time
-        logger.info(f"[{request_id}] Request completed | total_latency={total_latency:.3f}s | tts_enabled={tts_enabled}")
-        await manager.send({"type": "done"})
-
-
-async def handle_bot_reply_stream_v2(user_text: str, tts_enabled: bool = True):
-    """方案二：整段流式翻译 + 日文分句 TTS。"""
-    request_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
-    full_reply = ""
-
-    await manager.send({"type": "stream_start", "sender": mate_name})
-
-    try:
-        # Phase 1: LLM 流式生成中文
-        async for chunk in iterate_in_thread(
-            llm.generate_by_api_stream(user_text, request_id=request_id)
-        ):
-            if not chunk:
-                continue
-            full_reply += chunk
-            await manager.send({"type": "stream_chunk", "data": chunk})
-
-        await manager.send({"type": "stream_done"})
-        llm_latency = time.time() - start_time
-        logger.info(f"[{request_id}] LLM completed | latency={llm_latency:.3f}s")
-
-        web_chat_history.append({"sender": mate_name, "text": full_reply})
-        llm.append_history("assistant", full_reply)
-
-        # Phase 2: 整段中文 → 流式翻译日文 → 按句切分 → 逐句 TTS
-        if tts_enabled and full_reply.strip():
-            ja_buffer = ""
-            audio_index = 0
-
-            async for ja_chunk in iterate_in_thread(
-                llm.translate_stream(full_reply, request_id=request_id)
-            ):
-                if not ja_chunk:
-                    continue
-                ja_buffer += ja_chunk
-                sentences, ja_buffer = split_sentences(ja_buffer)
-                for s in sentences:
-                    logger.info(f"[{request_id}] JA sentence {audio_index}: {s[:30]}...")
-                    audio_base64 = await synthesize_sentence(s, request_id=request_id)
-                    if audio_base64:
-                        await manager.send({
-                            "type": "audio_chunk", "data": audio_base64,
-                            "index": audio_index
-                        })
-                        audio_index += 1
-
-            # flush 剩余 buffer
-            if ja_buffer.strip():
-                audio_base64 = await synthesize_sentence(ja_buffer, request_id=request_id)
-                if audio_base64:
-                    await manager.send({
-                        "type": "audio_chunk", "data": audio_base64,
-                        "index": audio_index
-                    })
-
-            await manager.send({"type": "audio_done"})
-
-    except Exception as e:
-        logger.error(f"[{request_id}] stream error: {e}")
-        await manager.send({"type": "stream_error", "text": f"\n（生成出错：{str(e)}）"})
-        await manager.send({"type": "stream_done"})
-
-    finally:
-        total_latency = time.time() - start_time
-        logger.info(f"[{request_id}] Request completed | total={total_latency:.3f}s")
-        await manager.send({"type": "done"})
-
-
-async def _tts_consumer_v3(queue: asyncio.Queue, request_id: str):
-    """从队列取日文句子 → TTS合成 → 发送音频。收到 None 哨兵时退出。"""
-    index = 0
-    while True:
-        sentence = await queue.get()
-        if sentence is None:
-            break
-        try:
-            logger.info(f"[{request_id}] TTS v3 sentence {index}: {sentence[:30]}...")
-            audio_base64 = await synthesize_sentence(sentence, request_id=request_id)
-            if audio_base64:
-                await manager.send({
-                    "type": "audio_chunk", "data": audio_base64,
-                    "index": index
-                })
-                index += 1
-        except Exception as e:
-            logger.error(f"[{request_id}] TTS v3 consumer error on sentence {index}: {e}")
-
-
-async def handle_bot_reply_stream_v3(user_text: str, tts_enabled: bool = True):
-    """方案三：整段流式翻译 + Queue 解耦 + 日文分句 TTS 并行。"""
-    request_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
-    full_reply = ""
-
-    await manager.send({"type": "stream_start", "sender": mate_name})
-
-    tts_queue: asyncio.Queue | None = None
-    consumer_task: asyncio.Task | None = None
-
-    try:
-        # Phase 1: LLM 流式生成中文（与 v2 相同）
-        async for chunk in iterate_in_thread(
-            llm.generate_by_api_stream(user_text, request_id=request_id)
-        ):
-            if not chunk:
-                continue
-            full_reply += chunk
-            await manager.send({"type": "stream_chunk", "data": chunk})
-
-        await manager.send({"type": "stream_done"})
-        llm_latency = time.time() - start_time
-        logger.info(f"[{request_id}] LLM completed | latency={llm_latency:.3f}s")
-
-        web_chat_history.append({"sender": mate_name, "text": full_reply})
-        llm.append_history("assistant", full_reply)
-
-        # Phase 2: 整段中文 → 流式翻译日文 → 按句入队 → consumer 并行 TTS
-        if tts_enabled and full_reply.strip():
-            tts_queue = asyncio.Queue()
-            consumer_task = asyncio.create_task(
-                _tts_consumer_v3(tts_queue, request_id)
+            full_reply = await _stream_llm(
+                user_text, request_id, round_num, start_time, on_chunk=_on_chunk
             )
 
-            ja_buffer = ""
-            async for ja_chunk in iterate_in_thread(
-                llm.translate_stream(full_reply, request_id=request_id)
-            ):
-                if not ja_chunk:
-                    continue
-                ja_buffer += ja_chunk
-                sentences, ja_buffer = split_sentences(ja_buffer)
-                for s in sentences:
-                    await tts_queue.put(s)
-
             # flush 剩余 buffer
-            if ja_buffer.strip():
-                await tts_queue.put(ja_buffer)
-
-            await tts_queue.put(None)  # 哨兵
+            if buffer.strip():
+                await tts_queue.put(buffer)
+            await tts_queue.put(None)
             await consumer_task
             await manager.send({"type": "audio_done"})
 
+        else:
+            # v2/v3/v4 及 TTS 关闭：普通 LLM 流式生成
+            full_reply = await _stream_llm(
+                user_text, request_id, round_num, start_time
+            )
+            llm_done_time = time.time()
+
+            # --- Phase 2: TTS 处理 ---
+            if tts_enabled and full_reply.strip():
+                if tts_mode == 2:
+                    # v2: 流式翻译 → 分句 → 串行 TTS（无 queue）
+                    ja_buffer = ""
+                    audio_index = 0
+                    async for ja_chunk in iterate_in_thread(
+                        llm.translate_stream(full_reply, request_id=request_id)
+                    ):
+                        if not ja_chunk:
+                            continue
+                        ja_buffer += ja_chunk
+                        sentences, ja_buffer = split_sentences(ja_buffer)
+                        for s in sentences:
+                            logger.info(f"[{request_id}] JA sentence {audio_index}: {s[:30]}...")
+                            audio_base64 = await synthesize_sentence(s, request_id=request_id)
+                            if audio_base64:
+                                await manager.send({
+                                    "type": "audio_chunk", "data": audio_base64,
+                                    "index": audio_index
+                                })
+                                audio_index += 1
+                    if ja_buffer.strip():
+                        audio_base64 = await synthesize_sentence(ja_buffer, request_id=request_id)
+                        if audio_base64:
+                            await manager.send({
+                                "type": "audio_chunk", "data": audio_base64,
+                                "index": audio_index
+                            })
+                    await manager.send({"type": "audio_done"})
+
+                else:
+                    # v3/v4: 流式翻译 → queue → consumer 并行 TTS
+                    tts_queue = asyncio.Queue()
+                    consumer_task = asyncio.create_task(
+                        _tts_consumer(tts_queue, request_id, mode=tts_mode,
+                                      llm_done_time=llm_done_time,
+                                      round_num=round_num,
+                                      start_time=start_time)
+                    )
+                    await _translate_and_enqueue(full_reply, request_id, round_num, tts_queue)
+                    await consumer_task
+                    await manager.send({"type": "audio_done"})
+
     except Exception as e:
-        logger.error(f"[{request_id}] stream error: {e}")
+        logger.error(f"[Round {round_num}][{request_id}] stream error: {e}")
         await manager.send({"type": "stream_error", "text": f"\n（生成出错：{str(e)}）"})
         await manager.send({"type": "stream_done"})
         if consumer_task is not None:
             consumer_task.cancel()
 
     finally:
-        total_latency = time.time() - start_time
-        logger.info(f"[{request_id}] Request completed | total={total_latency:.3f}s")
         await manager.send({"type": "done"})
 
 
