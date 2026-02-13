@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 import json
 from core.llm.main import LLMEngine
 from core.tts.main import TTSEngine, TTSRequest
+from core.emotion.main import EmotionEngine
 
 # Configure logging with timestamps
 logging.basicConfig(
@@ -63,6 +64,7 @@ app.mount("/data/assets/image", StaticFiles(directory="data/assets/image"))
 
 llm = LLMEngine()
 tts = TTSEngine()
+emotion_engine = EmotionEngine()
 
 web_chat_history = []
 
@@ -149,21 +151,6 @@ async def iterate_in_thread(sync_iterable):
         yield value
 
 
-async def synthesize_sentence(sentence: str, request_id: str = None) -> str | None:
-    """对单个句子调用 TTS，返回 base64 音频字符串，失败返回 None。"""
-    try:
-        tts_req = TTSRequest(text=sentence)
-        result = await tts.synthesize(tts_req, request_id=request_id)
-        if result.get("success"):
-            audio_data = result.get("audio_bytes")
-            if audio_data:
-                return base64.b64encode(audio_data).decode('utf-8')
-        else:
-            logger.error(f"TTS synthesis failed: {result.get('error')}")
-    except Exception as e:
-        logger.error(f"TTS exception: {e}")
-    return None
-
 
 SENTENCE_DELIMITERS = re.compile(r'(?<=[。！？；\n])')
 
@@ -177,9 +164,10 @@ def split_sentences(text: str) -> tuple[list[str], str]:
 
 
 async def _stream_llm(user_text: str, request_id: str, round_num: int,
-                      start_time: float, on_chunk=None):
+                      start_time: float, on_chunk=None, silent=False):
     """LLM 流式生成阶段，返回 full_reply。
-    on_chunk: 可选回调，v1 模式用于实时分句入队。"""
+    on_chunk: 可选回调，v1 模式用于实时分句入队。
+    silent: True 时不推送 stream_chunk/stream_done 到前端（v2+emotion 用）。"""
     full_reply = ""
 
     async for chunk in iterate_in_thread(
@@ -188,11 +176,13 @@ async def _stream_llm(user_text: str, request_id: str, round_num: int,
         if not chunk:
             continue
         full_reply += chunk
-        await manager.send({"type": "stream_chunk", "data": chunk})
+        if not silent:
+            await manager.send({"type": "stream_chunk", "data": chunk})
         if on_chunk:
             await on_chunk(chunk)
 
-    await manager.send({"type": "stream_done"})
+    if not silent:
+        await manager.send({"type": "stream_done"})
 
     web_chat_history.append({"sender": mate_name, "text": full_reply})
     llm.append_history("assistant", full_reply)
@@ -223,8 +213,14 @@ async def _translate_and_enqueue(full_reply: str, request_id: str, round_num: in
 
 async def _tts_consumer(queue: asyncio.Queue, request_id: str, mode: int,
                         llm_done_time: float, round_num: int,
-                        start_time: float):
-    """统一 TTS consumer。mode=1: 中文→翻译→TTS; mode=3: 日文→TTS; mode=4: 日文→流式TTS。"""
+                        start_time: float,
+                        ref_audio_path: str = None, prompt_text: str = None):
+    """统一 TTS consumer。
+    mode=1: LLM 边生成边分句(中文) → 每句独立翻译(中→日) → 流式 TTS → 按 RIFF 头切分发送音频 chunk
+            特点：LLM 生成与翻译+TTS 并行，首段音频延迟最低，但每句需独立翻译调用
+    mode=2: LLM 生成完毕后，整段中文流式翻译(中→日) → 日文分句入队 → 流式 TTS → 按 RIFF 头切分发送
+            特点：仅 1 次翻译调用，翻译与 TTS 通过 Queue 解耦并行，首段音频需等 LLM 生成完毕
+    """
     loop = asyncio.get_running_loop()
     index = 0
     first_audio_sent = False
@@ -237,7 +233,7 @@ async def _tts_consumer(queue: asyncio.Queue, request_id: str, mode: int,
             tts_start = time.time()
 
             if mode == 1:
-                # v1: 中文句子 → 翻译 → 流式 TTS
+                # v1: 从 queue 取出中文句子 → 翻译为日文 → 流式 TTS → 按 RIFF 头切分 → 逐段发送音频 chunk
                 translate_start = time.time()
                 ja_text = await loop.run_in_executor(None, llm.translate, sentence)
                 if not ja_text:
@@ -298,30 +294,9 @@ async def _tts_consumer(queue: asyncio.Queue, request_id: str, mode: int,
                 else:
                     logger.error(f"[Round {round_num}][{request_id}] TTS streaming failed: {result.get('error')}")
 
-            elif mode == 3:
-                # v3: 日文句子 → 非流式 TTS
-                audio_base64 = await synthesize_sentence(sentence, request_id=request_id)
-                if audio_base64:
-                    tts_latency = time.time() - tts_start
-                    await manager.send({"type": "audio_chunk", "data": audio_base64, "index": index})
-                    if not first_audio_sent:
-                        now = time.time()
-                        llm_latency = llm_done_time - start_time
-                        translate_to_first_sentence = tts_start - llm_done_time
-                        request_to_first_audio = now - start_time
-                        logger.info(
-                            f"[Round {round_num}][{request_id}] First audio sent"
-                            f" | request_to_first_audio={request_to_first_audio:.3f}s"
-                            f" (llm={llm_latency:.3f}s"
-                            f" + translate_to_first_sentence={translate_to_first_sentence:.3f}s"
-                            f" + tts={tts_latency:.3f}s)"
-                        )
-                        first_audio_sent = True
-                    index += 1
-
-            elif mode == 4:
-                # v4: 日文句子 → 流式 TTS
-                tts_req = TTSRequest(text=sentence)
+            elif mode == 2:
+                # v2: 从 queue 取出日文句子 → 流式 TTS → 按 RIFF 头切分 → 逐段发送音频 chunk
+                tts_req = TTSRequest(text=sentence, ref_audio_path=ref_audio_path, prompt_text=prompt_text)
                 result = await tts.synthesize_streaming(tts_req, request_id=request_id)
                 if result.get("success"):
                     audio_stream = result.get("audio_stream")
@@ -381,7 +356,10 @@ async def _tts_consumer(queue: asyncio.Queue, request_id: str, mode: int,
 
 
 async def handle_bot_reply(user_text: str, tts_enabled: bool, tts_mode: int):
-    """统一入口，替代 4 个独立 handler。"""
+    """处理机器人回复的统一入口。
+    tts_mode=1: LLM 边生成边分句，每句独立翻译+流式TTS（LLM 与 TTS 并行）
+    tts_mode=2: LLM 生成完毕后，整段流式翻译+流式TTS（翻译与 TTS 通过 Queue 并行）
+    """
     global conversation_round
     conversation_round += 1
     round_num = conversation_round
@@ -395,9 +373,10 @@ async def handle_bot_reply(user_text: str, tts_enabled: bool, tts_mode: int):
     consumer_task: asyncio.Task | None = None
 
     try:
-        # --- Phase 1: LLM 流式生成 ---
-        if tts_mode == 1 and tts_enabled:
-            # v1 特殊：LLM 生成期间实时分句入队（中文句子）
+        # --- v1: LLM 生成与翻译+TTS 并行 ---
+        # 流程: LLM 流式生成中文 → 实时按标点分句 → 每句入队 → consumer 逐句翻译(中→日) → 流式 TTS
+        if tts_mode == 1 and tts_enabled and not llm.emotion_enabled:
+            # LLM 生成期间实时分句入队（中文句子），consumer 同步消费
             tts_queue = asyncio.Queue()
             consumer_task = asyncio.create_task(
                 _tts_consumer(tts_queue, request_id, mode=1,
@@ -425,55 +404,45 @@ async def handle_bot_reply(user_text: str, tts_enabled: bool, tts_mode: int):
             await manager.send({"type": "audio_done"})
 
         else:
-            # v2/v3/v4 及 TTS 关闭：普通 LLM 流式生成
+            # --- v2 或 TTS 关闭: 先完成 LLM 生成，再处理 TTS ---
+            # 流程: LLM 流式生成中文(完整) → 整段流式翻译(中→日) → 日文分句入队 → consumer 流式 TTS
+            # v2 + emotion_enabled: 静默收集 LLM JSON 输出，解析后一次性发送纯文本
+            use_emotion = llm.emotion_enabled
             full_reply = await _stream_llm(
-                user_text, request_id, round_num, start_time
+                user_text, request_id, round_num, start_time,
+                silent=use_emotion
             )
             llm_done_time = time.time()
 
-            # --- Phase 2: TTS 处理 ---
-            if tts_enabled and full_reply.strip():
-                if tts_mode == 2:
-                    # v2: 流式翻译 → 分句 → 串行 TTS（无 queue）
-                    ja_buffer = ""
-                    audio_index = 0
-                    async for ja_chunk in iterate_in_thread(
-                        llm.translate_stream(full_reply, request_id=request_id)
-                    ):
-                        if not ja_chunk:
-                            continue
-                        ja_buffer += ja_chunk
-                        sentences, ja_buffer = split_sentences(ja_buffer)
-                        for s in sentences:
-                            logger.info(f"[{request_id}] JA sentence {audio_index}: {s[:30]}...")
-                            audio_base64 = await synthesize_sentence(s, request_id=request_id)
-                            if audio_base64:
-                                await manager.send({
-                                    "type": "audio_chunk", "data": audio_base64,
-                                    "index": audio_index
-                                })
-                                audio_index += 1
-                    if ja_buffer.strip():
-                        audio_base64 = await synthesize_sentence(ja_buffer, request_id=request_id)
-                        if audio_base64:
-                            await manager.send({
-                                "type": "audio_chunk", "data": audio_base64,
-                                "index": audio_index
-                            })
-                    await manager.send({"type": "audio_done"})
+            # 情感解析（仅 v2 + emotion_enabled）
+            ref_audio_path = None
+            prompt_text = None
+            if use_emotion:
+                emo, text_only = emotion_engine.parse_response(full_reply)
+                ref_audio_path = emotion_engine.get_ref_audio(emo)
+                prompt_text = emotion_engine.get_prompt_text(emo)
+                logger.info(f"[Round {round_num}][{request_id}] Emotion: {emo} → {ref_audio_path}")
+                # 更新历史和 LLM 记录为纯文本
+                web_chat_history[-1]["text"] = text_only
+                # 一次性发送纯文本到前端
+                await manager.send({"type": "stream_chunk", "data": text_only})
+                await manager.send({"type": "stream_done"})
+                full_reply = text_only
 
-                else:
-                    # v3/v4: 流式翻译 → queue → consumer 并行 TTS
-                    tts_queue = asyncio.Queue()
-                    consumer_task = asyncio.create_task(
-                        _tts_consumer(tts_queue, request_id, mode=tts_mode,
-                                      llm_done_time=llm_done_time,
-                                      round_num=round_num,
-                                      start_time=start_time)
-                    )
-                    await _translate_and_enqueue(full_reply, request_id, round_num, tts_queue)
-                    await consumer_task
-                    await manager.send({"type": "audio_done"})
+            if tts_enabled and full_reply.strip():
+                # v2: 整段翻译与流式 TTS 通过 Queue 解耦并行
+                tts_queue = asyncio.Queue()
+                consumer_task = asyncio.create_task(
+                    _tts_consumer(tts_queue, request_id, mode=2,
+                                  llm_done_time=llm_done_time,
+                                  round_num=round_num,
+                                  start_time=start_time,
+                                  ref_audio_path=ref_audio_path,
+                                  prompt_text=prompt_text)
+                )
+                await _translate_and_enqueue(full_reply, request_id, round_num, tts_queue)
+                await consumer_task
+                await manager.send({"type": "audio_done"})
 
     except Exception as e:
         logger.error(f"[Round {round_num}][{request_id}] stream error: {e}")

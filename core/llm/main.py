@@ -11,7 +11,11 @@ class LLMEngine:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
         self.client = OpenAI(api_key=config["api_key"], base_url=config["api_url"])
-        self.prompt = config["prompt"]
+        self.emotion_enabled = config.get("emotion_enabled", "False") == "True"
+        if self.emotion_enabled:
+            self.prompt = config["emotion_prompt"]
+        else:
+            self.prompt = config["prompt"]
         self.model = config["model"]
         self.translate_prompt = config.get("translate_prompt", "将以下中文翻译成日文，只输出日文，不要任何解释：")
         # 与用户对话的消息列表

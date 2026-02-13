@@ -11,9 +11,11 @@ lumina/
 │   ├── llm/               # 大语言模型引擎
 │   │   ├── main.py        # LLMEngine 类
 │   │   └── config.json    # LLM 配置（API地址、模型、prompt）
-│   └── tts/               # 语音合成引擎
-│       ├── main.py        # TTSEngine 类
-│       └── config.json    # TTS 配置（GPT-SoVITS地址、参考音频）
+│   ├── tts/               # 语音合成引擎
+│   │   ├── main.py        # TTSEngine 类
+│   │   └── config.json    # TTS 配置（GPT-SoVITS地址、参考音频）
+│   └── emotion/           # 情感引擎
+│       └── main.py        # EmotionEngine 类（情感→参考音频映射）
 ├── service/               # 服务层
 │   └── webchat/           # Web 聊天服务
 │       ├── main.py        # FastAPI 应用
@@ -56,29 +58,46 @@ result = await tts.synthesize(req)
 
 ## 数据流
 
+v1 模式（LLM 与 TTS 并行）：
 ```
 用户输入 → WebSocket → LLM流式生成(中文) → 实时文本显示
-                                ↓ (流结束后)
-                         LLM翻译(中→日) → TTS合成 → 音频播放
+                              ↓ (边生成边按标点分句)
+                        每句翻译(中→日) → 流式TTS → 音频播放
+```
+
+v2 模式（翻译与 TTS 并行）：
+```
+用户输入 → WebSocket → LLM流式生成(中文) → 实时文本显示
+                              ↓ (流结束后)
+                       整段流式翻译(中→日) → 日文分句 → 流式TTS → 音频播放
+```
+
+v2 + emotion_enabled 模式：
+```
+用户输入 → WebSocket → LLM完整生成JSON {"emotion":"开心","text":"正文"}
+                              ↓
+                    EmotionEngine.parse_response() → (emotion, text)
+                              ↓                           ↓
+                    emotion → ref_audio_path        text → 前端显示
+                              ↓                           ↓
+                    整段流式翻译(中→日) → 日文分句 → 流式TTS(ref_audio_path) → 音频播放
 ```
 
 1. 前端通过 WebSocket 发送用户消息
 2. 后端调用 LLM 流式生成纯中文回复，实时推送文本到前端
-3. 流结束后，若 TTS 开启，调用 `llm.translate()` 将中文翻译为日文
-4. 将日文发送给 TTS 合成音频，返回前端播放
+3. 若 TTS 开启，v1 边生成边分句翻译+TTS，v2 等生成完毕后整段翻译+TTS
+4. 音频通过流式 TTS 合成，按 WAV RIFF 头切分后逐段发送到前端播放
 
 ## TTS 模式
 
 前端通过 `tts_mode` 参数选择 TTS 处理方案：
 
-| 模式 | 说明 | 延迟特点 |
-|------|------|----------|
-| 1 | LLM 边生成边分句，每句独立翻译+TTS | N 次翻译调用 |
-| 2 | 整段流式翻译 → 日文分句 → 串行 TTS | 1 次翻译 |
-| 3 | 整段流式翻译 + Queue 解耦 + 日文分句 TTS 并行 | 翻译与 TTS 并行 |
-| 4 | 整段流式翻译 + Queue 解耦 + 流式 TTS | 首段音频延迟最低 |
+| 模式 | 说明 | 延迟特点 | 情感支持 |
+|------|------|----------|----------|
+| 1 | LLM 边生成边分句，每句独立翻译+流式TTS | LLM 与 TTS 并行，首段音频延迟最低，N 次翻译调用 | 不支持（纯流式） |
+| 2 | LLM 生成完毕 → 整段流式翻译 + Queue 解耦 + 流式 TTS | 1 次翻译调用，翻译与 TTS 并行，首段音频需等 LLM 完成 | 支持（JSON → emotion → ref_audio） |
 
-v4 使用 `tts.synthesize_streaming()` 流式获取音频 chunk，边合成边发送，首段音频到达时间比 v3 更快。
+两种模式均使用 `tts.synthesize_streaming()` 流式获取音频 chunk，边合成边发送。
 
 ## 运行
 
@@ -95,7 +114,9 @@ python main.py
 - `api_key`: API 密钥
 - `model`: 模型名称
 - `prompt`: 聊天系统提示词（只输出中文）
+- `emotion_prompt`: 情感模式提示词（输出 JSON，含 emotion + text）
 - `translate_prompt`: 翻译提示词（中文→日文，供 TTS 使用）
+- `emotion_enabled`: 是否启用情感系统（"True"/"False"，仅 v2 模式生效）
 
 ### TTS (`core/tts/config.json`)
 - `GPT-SoVITS_url`: TTS 服务地址

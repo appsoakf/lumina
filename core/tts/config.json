@@ -1,6 +1,6 @@
 {
     "GPT-SoVITS_url": "http://127.0.0.1:9880",
-    "ref_path": "ref_audios/sample.wav",
+    "ref_path": "ref_audios/calm.wav",
     "prompt_text": "カフェインはカプセルで摂取すれば良いのではないかしら？",
     "prompt_lang": "ja"
 }
