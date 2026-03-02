@@ -7,6 +7,7 @@ from core.agentic.critic_agent import CriticAgent
 from core.agentic.executor_agent import ExecutorAgent
 from core.agentic.planner_agent import PlannerAgent
 from core.capabilities import CapabilityRegistry, build_default_registry
+from core.memory import MemoryService
 from core.orchestrator.task_graph import TaskGraph
 from core.protocols import CriticResult, ExecutorRunResult, OrchestrationResult, RoutingIntent, TaskState
 from core.tasks import TaskManager
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class LuminaOrchestrator:
-    """Phase 4-Lite orchestrator: dynamic capability routing + task lifecycle manager."""
+    """Phase 6 orchestrator: dynamic routing + task lifecycle + memory system."""
 
     TASK_ID_RE = re.compile(r"(t-[0-9]{14}-[a-f0-9]{8})", re.IGNORECASE)
 
@@ -29,6 +30,7 @@ class LuminaOrchestrator:
         travel_workflow: Optional[TravelWorkflow] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         task_manager: Optional[TaskManager] = None,
+        memory_service: Optional[MemoryService] = None,
     ):
         self._agents = {
             "chat_agent": chat_agent or ChatAgent(),
@@ -39,6 +41,7 @@ class LuminaOrchestrator:
         self.travel_workflow = travel_workflow or TravelWorkflow()
         self.capabilities = capability_registry or build_default_registry()
         self.task_manager = task_manager or TaskManager()
+        self.memory = memory_service or MemoryService()
 
     def _resolve_agent(self, capability: str):
         agent_name = self.capabilities.resolve_agent(capability)
@@ -46,6 +49,31 @@ class LuminaOrchestrator:
         if agent is None:
             raise ValueError(f"Agent not initialized: {agent_name}")
         return agent_name, agent
+
+    def _augment_history_with_memory(self, history: List[Dict[str, str]], user_id: str, query: str) -> List[Dict[str, str]]:
+        context = self.memory.build_context(user_id=user_id, query=query)
+        if not context:
+            return list(history)
+        mem_msg = {
+            "role": "system",
+            "content": (
+                "以下是用户记忆上下文，可用于提升个性化和连续性；"
+                "如与当前用户明确指令冲突，以当前指令为准。\n" + context
+            ),
+        }
+        return [mem_msg] + list(history[-12:])
+
+    def _record_memory(self, session_id: str, user_id: str, user_text: str, final_reply: str, meta: Dict) -> None:
+        try:
+            self.memory.ingest_turn(
+                session_id=session_id,
+                user_id=user_id,
+                user_text=user_text,
+                assistant_reply=final_reply,
+                meta=meta,
+            )
+        except Exception as exc:
+            logger.warning(f"Memory ingest skipped due to error: {exc}")
 
     def _build_step_task_input(self, user_text: str, graph: TaskGraph, step_id: str) -> str:
         node = next(n for n in graph.nodes if n.step_id == step_id)
@@ -174,7 +202,11 @@ class LuminaOrchestrator:
                 lines.append(f"- [{s.get('step_id')}] {s.get('state')} | {s.get('title')}")
         return "\n".join(lines)
 
-    def _handle_task_command(self, user_text: str, history: List[Dict[str, str]]) -> Optional[OrchestrationResult]:
+    def _handle_task_command(
+        self,
+        user_text: str,
+        history: List[Dict[str, str]],
+    ) -> Optional[OrchestrationResult]:
         cmd = self._extract_task_command(user_text)
         if not cmd:
             return None
@@ -206,11 +238,77 @@ class LuminaOrchestrator:
             final_reply=final_reply,
             executor_result=None,
             meta={
-                "phase": "phase4-lite",
+                "phase": "phase6",
                 "task_command": action,
                 "task_id": task_id,
                 "task_mode": False,
                 "agent_chain": ["chat_agent"],
+            },
+        )
+
+    def _handle_memory_command(
+        self,
+        user_text: str,
+        history: List[Dict[str, str]],
+        session_id: str,
+        user_id: str,
+    ) -> Optional[OrchestrationResult]:
+        cmd = self.memory.parse_memory_command(user_text)
+        if not cmd:
+            return None
+
+        _, chat_agent = self._resolve_agent("chat")
+        action = cmd.get("action", "")
+
+        if action == "remember":
+            value = (cmd.get("value") or "").strip()
+            if not value:
+                result_text = "请在“记住”后提供要保存的信息。"
+            else:
+                memory_id = self.memory.remember(user_id=user_id, session_id=session_id, content=value)
+                result_text = f"已记住（#{memory_id}）：{value}"
+        elif action == "list_profile":
+            rows = self.memory.list_profile(user_id=user_id, limit=8)
+            if not rows:
+                result_text = "当前还没有已记录的偏好记忆。"
+            else:
+                lines = ["你的偏好记忆："]
+                for r in rows:
+                    lines.append(f"- #{r.get('memory_id')} {r.get('content')}")
+                result_text = "\n".join(lines)
+        elif action == "list_commitments":
+            rows = self.memory.list_commitments(user_id=user_id, limit=8)
+            if not rows:
+                result_text = "当前没有未完成待办。"
+            else:
+                lines = ["你的未完成待办："]
+                for r in rows:
+                    due = (r.get("payload") or {}).get("due", "")
+                    suffix = f" (截止:{due})" if due else ""
+                    lines.append(f"- #{r.get('memory_id')} {r.get('content')}{suffix}")
+                result_text = "\n".join(lines)
+        elif action == "close_commitment":
+            memory_id = int(cmd.get("memory_id"))
+            ok = self.memory.close_commitment(user_id=user_id, memory_id=memory_id)
+            result_text = f"待办 #{memory_id} 已标记完成。" if ok else f"未找到待办 #{memory_id}。"
+        else:
+            result_text = "未知记忆指令。"
+
+        final_reply = chat_agent.reply_with_task_result(
+            user_text=user_text,
+            executor_output=result_text,
+            history=history,
+        )
+
+        return OrchestrationResult(
+            intent=RoutingIntent.CHAT,
+            final_reply=final_reply,
+            executor_result=None,
+            meta={
+                "phase": "phase6",
+                "memory_command": action,
+                "task_mode": False,
+                "agent_chain": ["chat_agent", "memory_service", "chat_agent"],
             },
         )
 
@@ -224,21 +322,37 @@ class LuminaOrchestrator:
         # task lifecycle commands
         command_result = self._handle_task_command(user_text=user_text, history=history)
         if command_result is not None:
+            self._record_memory(session_id, user_id, user_text, command_result.final_reply, command_result.meta)
             return command_result
 
+        # memory commands
+        memory_result = self._handle_memory_command(
+            user_text=user_text,
+            history=history,
+            session_id=session_id,
+            user_id=user_id,
+        )
+        if memory_result is not None:
+            self._record_memory(session_id, user_id, user_text, memory_result.final_reply, memory_result.meta)
+            return memory_result
+
+        enriched_history = self._augment_history_with_memory(history=history, user_id=user_id, query=user_text)
+
         _, chat_agent = self._resolve_agent("chat")
-        intent = chat_agent.classify_intent(user_text=user_text, history=history)
+        intent = chat_agent.classify_intent(user_text=user_text, history=enriched_history)
 
         if intent == RoutingIntent.CHAT:
-            final_reply = chat_agent.reply_chat(user_text=user_text, history=history)
+            final_reply = chat_agent.reply_chat(user_text=user_text, history=enriched_history)
+            meta = {"agent_chain": ["chat_agent"], "task_mode": False, "phase": "phase6"}
+            self._record_memory(session_id, user_id, user_text, final_reply, meta)
             return OrchestrationResult(
                 intent=RoutingIntent.CHAT,
                 final_reply=final_reply,
                 executor_result=None,
-                meta={"agent_chain": ["chat_agent"], "task_mode": False, "phase": "phase4-lite"},
+                meta=meta,
             )
 
-        # task mode (phase4-lite)
+        # task mode (phase6)
         task = self.task_manager.create_task(session_id=session_id, user_text=user_text)
         task_id = task.task_id
         self.task_manager.set_state(task_id, TaskState.RUNNING)
@@ -267,33 +381,36 @@ class LuminaOrchestrator:
                 final_reply = chat_agent.reply_with_task_result(
                     user_text=user_text,
                     executor_output=clarification,
-                    history=history,
+                    history=enriched_history,
                 )
+                meta = {
+                    "phase": "phase6",
+                    "task_id": task_id,
+                    "workflow": "travel",
+                    "need_clarification": True,
+                    "missing_fields": missing,
+                    "constraints": travel_constraints.to_dict(),
+                    "agent_chain": ["chat_agent", "workflow_guard", "chat_agent"],
+                    "task_mode": True,
+                    "task_error": False,
+                }
+                self._record_memory(session_id, user_id, user_text, final_reply, meta)
                 return OrchestrationResult(
                     intent=RoutingIntent.TASK,
                     final_reply=final_reply,
                     executor_result=executor_result,
-                    meta={
-                        "phase": "phase4-lite",
-                        "task_id": task_id,
-                        "workflow": "travel",
-                        "need_clarification": True,
-                        "missing_fields": missing,
-                        "constraints": travel_constraints.to_dict(),
-                        "agent_chain": ["chat_agent", "workflow_guard", "chat_agent"],
-                        "task_mode": True,
-                    },
+                    meta=meta,
                 )
             plan_result = self.travel_workflow.build_plan(user_text=user_text, constraints=travel_constraints)
         else:
-            plan_result = planner_agent.plan_task(user_text=user_text, history=history)
+            plan_result = planner_agent.plan_task(user_text=user_text, history=enriched_history)
 
         self.task_manager.set_plan(task_id, plan_result.to_dict())
 
         graph = TaskGraph.from_plan(plan_result)
         run_info = self._run_plan_steps(
             user_text=user_text,
-            history=history,
+            history=enriched_history,
             user_id=user_id,
             session_id=session_id,
             task_id=task_id,
@@ -339,11 +456,11 @@ class LuminaOrchestrator:
         final_reply = chat_agent.reply_with_task_result(
             user_text=user_text,
             executor_output=executor_result.output_text,
-            history=history,
+            history=enriched_history,
         )
 
         meta = {
-            "phase": "phase4-lite",
+            "phase": "phase6",
             "task_id": task_id,
             "agent_chain": ["chat_agent", "planner_agent", "executor_agent", "critic_agent", "chat_agent"],
             "task_mode": True,
@@ -351,11 +468,13 @@ class LuminaOrchestrator:
             "plan": plan_result.to_dict(),
             "task_graph": graph.to_dict(),
             "critic": critic_result.to_dict(),
+            "task_error": bool(run_info["first_error"]),
         }
         if workflow_mode == "travel" and travel_constraints is not None:
             meta["constraints"] = travel_constraints.to_dict()
             meta["workflow_review"] = workflow_review
 
+        self._record_memory(session_id, user_id, user_text, final_reply, meta)
         return OrchestrationResult(
             intent=RoutingIntent.TASK,
             final_reply=final_reply,

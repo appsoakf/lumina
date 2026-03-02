@@ -52,7 +52,6 @@ sock = Sock(app)
 # --- thread pool ---
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
-conversation_round = 0
 SENTENCE_DELIMITERS = re.compile(r'(?<=[。！？；\n])')
 
 
@@ -158,10 +157,7 @@ def consume_and_send(ws, ordered_map: OrderedSentenceMap):
     ws_send(ws, {"type": "audio_done"})
 
 
-def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, trace: TraceLogger):
-    global conversation_round
-    conversation_round += 1
-    round_num = conversation_round
+def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, trace: TraceLogger, round_num: int):
     started = time.time()
 
     trace.log("round_start", {"round": round_num, "user_text": user_text})
@@ -289,6 +285,7 @@ def websocket_handler(ws):
     session_id = f"ws-{uuid.uuid4().hex[:10]}"
     trace = TraceLogger(session_id=session_id)
     trace.log("session_start", {"session_id": session_id})
+    round_count = 0
 
     disconnect_reason = "client_closed"
     try:
@@ -300,7 +297,8 @@ def websocket_handler(ws):
             user_text = data.get("content", "").strip()
             if not user_text:
                 continue
-            handle_bot_reply(ws, user_text, history, session_id, trace)
+            round_count += 1
+            handle_bot_reply(ws, user_text, history, session_id, trace, round_count)
     except Exception as exc:
         disconnect_reason = str(exc)
         logger.info(f"WebSocket disconnected: {exc}")
@@ -313,7 +311,7 @@ def websocket_handler(ws):
             },
         )
     finally:
-        trace.log("session_end", {"reason": disconnect_reason, "rounds": conversation_round})
+        trace.log("session_end", {"reason": disconnect_reason, "rounds": round_count})
         trace.close()
 
 

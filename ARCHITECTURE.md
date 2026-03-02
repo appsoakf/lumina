@@ -1,74 +1,65 @@
-# Lumina 架构文档（Phase 4-Lite）
+# Lumina 架构文档（Phase 6）
 
 ## 1. 项目定位
-Lumina 是一个本地部署的实时 AI 语音助手框架。当前 Phase 4-Lite 已实现：
-- 常驻 `chat_agent`
-- `planner_agent`、`executor_agent`、`critic_agent`
-- `orchestrator` 统一调度
-- `travel_workflow` 场景化执行
-- `capability registry` 动态路由
-- `task manager/store` 任务生命周期管理（创建/查询/取消/重试）
+Lumina 是一个本地部署的实时 AI 语音助手框架。当前 Phase 6 已实现：
+- 多智能体编排（chat/planner/executor/critic）
+- 任务生命周期管理（create/query/cancel/retry）
+- 场景工作流（travel_workflow）
+- 本地记忆系统（Memory OS Lite）
 - 现有情感驱动 TTS 流式链路保持不变
 
 入口：`main.py -> service.pet.main.run_pet()`。
 
-## 2. 核心模块职责
-- `core/capabilities/registry.py`
-  - 维护 agent 能力声明与优先级
-  - 运行时按 capability 解析目标 agent（不再硬编码调用对象）
+## 2. 新增记忆系统（core/memory）
+- `models.py`: `MemoryType`、`MemoryRecord`
+- `store.py`: SQLite 持久化（`runtime/memory/memory.db`）
+- `policy.py`: 记忆写入策略（profile/commitment/episodic）
+- `ingestor.py`: 从用户语句抽取偏好与待办候选
+- `retriever.py`: 记忆检索（profile/open commitments/relevant）
+- `service.py`: 统一网关 `MemoryService`
 
-- `core/tasks/models.py`
-  - `TaskRecord` 任务状态模型
-- `core/tasks/store.py`
-  - 任务落盘到 `runtime/tasks`
-- `core/tasks/manager.py`
-  - 生命周期接口：创建、查询、更新状态、取消、重试、写步骤结果
+记忆类型：
+- `profile`（长期偏好）
+- `commitment`（待办承诺）
+- `episodic`（会话片段）
+- `procedural`（任务流程经验）
+- `artifact`（预留）
 
-- `core/orchestrator/lumina_orchestrator.py`
-  - Phase 4-Lite 中心编排器
-  - 支持任务指令：`查询任务 <task_id>`、`取消任务 <task_id>`、`重试任务 <task_id>`
-  - task 执行链：`chat -> planner/workflow -> executor(step-loop) -> critic -> chat`
+## 3. Orchestrator（Phase 6）
+`core/orchestrator/lumina_orchestrator.py` 新能力：
+1. 每轮请求前：注入记忆上下文到 agent history（个性化与连续性）
+2. 每轮请求后：自动沉淀记忆（偏好、待办、会话摘要、流程经验）
+3. 增加记忆指令：
+   - `记住 xxx`
+   - `我的偏好` / `查看记忆`
+   - `我的待办` / `查看待办`
+   - `完成待办 #<memory_id>`
+4. 保留任务指令：
+   - `查询任务 <task_id>`
+   - `取消任务 <task_id>`
+   - `重试任务 <task_id>`
 
-- `core/workflows/travel_workflow.py`
-  - 旅游场景约束解析、缺失信息追问、模板化计划、质量复核
+## 4. 端到端流程（当前）
+1. WS 收到用户消息
+2. orchestrator 先处理任务指令 / 记忆指令
+3. 非指令请求：注入记忆上下文后做 chat/task 路由
+4. task 模式执行多 agent 链路 + task manager 状态跟踪
+5. 结果写回 memory + session + trace
+6. 输出走 emotion/translate/tts/audio streaming
 
-- `service/pet/main.py`
-  - WebSocket 接入层
-  - 调用 orchestrator + trace/session
-  - 文本->分句->翻译->TTS->音频流推送
+## 5. 持久化目录
+- `runtime/memory/` 记忆库
+- `runtime/tasks/` 任务状态
+- `runtime/sessions/` 会话快照
+- `runtime/traces/` 事件追踪
+- `runtime/notes/` 工具输出
 
-## 3. 端到端流程（当前）
-1. 客户端发送 `{"content":"..."}` 到 `/ws`
-2. orchestrator 先检查是否是任务管理指令（查询/取消/重试）
-3. 若是普通对话：`chat_agent` 直接回复
-4. 若是任务：创建 task_id 并进入执行链
-5. 执行过程中的计划和步骤结果写入任务记录
-6. 任务完成后状态写回 `SUCCEEDED/FAILED`
-7. 最终文本继续走情感解析与 TTS 流式输出
+## 6. 协议与状态
+- `TaskState`: `pending/running/succeeded/failed/cancelled`
+- `OrchestrationResult`: 兼容原接口，新增 `phase=phase6` 等 meta
+- 错误码体系仍沿用 `core/error_codes.py`
 
-## 4. 关键协议
-- WebSocket 输入：`{"content":"用户文本"}`
-- WebSocket 输出：
-  - `emotion_text`
-  - `audio_chunk`
-  - `audio_done`
-  - `done`
-  - `error`（统一错误码结构）
-
-## 5. 可靠性与观测
-- 熔断：`translate`、`tts`
-- Trace：异步队列写盘（`runtime/traces`）
-- Session：会话落盘（`runtime/sessions`）
-- Task：生命周期落盘（`runtime/tasks`）
-
-## 6. 配置与错误体系
-- 统一配置入口：`core/config.py`
-- 统一错误码：`core/error_codes.py`
-- 统一错误对象：`core/errors.py`
-
-## 7. 精简约束
-Phase 4-Lite 未引入：
-- 工具权限白名单
-- 执行防护策略（命令/路径限制）
-
-设计目标是先保证扩展性与任务可管理性，后续再增量补安全策略。
+## 7. 设计边界（简洁版）
+- 当前记忆检索为本地 SQLite + 关键词匹配，不引入复杂向量基础设施
+- 未引入权限白名单与执行防护（遵循 Phase 4-Lite 约束）
+- 后续可增量扩展：向量检索、冲突消解、记忆衰减与归档
