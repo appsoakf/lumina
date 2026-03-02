@@ -200,7 +200,7 @@ class MemoryService:
                     content=f"任务模板: {plan.get('goal', '')}",
                     tags="procedural,task_template",
                     source="task_summary",
-                    payload={"plan": plan, "workflow": meta.get("workflow", "general")},
+                    payload={"plan": plan},
                 )
                 self._add_if_not_duplicate(rec)
 

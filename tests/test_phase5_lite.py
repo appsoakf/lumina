@@ -13,7 +13,6 @@ from core.integration.trace_logger import TraceLogger
 from core.protocols import TaskState
 from core.tasks.manager import TaskManager
 from core.tasks.store import TaskStore
-from core.workflows.travel_workflow import TravelWorkflow
 
 
 class Phase5LiteTests(unittest.TestCase):
@@ -61,36 +60,6 @@ class Phase5LiteTests(unittest.TestCase):
         self.assertIsNotNone(retried)
         self.assertEqual(retried.state, TaskState.PENDING)
         self.assertEqual(retried.step_results, [])
-
-    def test_travel_workflow_parse_constraints(self):
-        wf = TravelWorkflow()
-        text = "请帮我规划一个去北京4天旅游计划，预算5000元，2人，喜欢美食和夜景"
-        c = wf.parse_constraints(text)
-
-        self.assertEqual(c.destination, "北京")
-        self.assertEqual(c.days, 4)
-        self.assertEqual(c.budget_cny, 5000)
-        self.assertIn("美食", c.preferences)
-        self.assertIn("夜景", c.preferences)
-
-    def test_travel_workflow_missing_and_clarification(self):
-        wf = TravelWorkflow()
-        c = wf.parse_constraints("请给我做个旅游计划")
-        missing = wf.missing_required_fields(c)
-        self.assertIn("destination", missing)
-        self.assertIn("days", missing)
-
-        q = wf.build_clarification_request(c, missing)
-        self.assertIn("目的地", q)
-        self.assertIn("出行天数", q)
-
-    def test_travel_workflow_plan_template(self):
-        wf = TravelWorkflow()
-        c = wf.parse_constraints("我想去北京3天旅游")
-        plan = wf.build_plan("我想去北京3天旅游", c)
-
-        self.assertGreaterEqual(len(plan.steps), 3)
-        self.assertEqual(plan.steps[0].step_id, "S1")
 
     def test_trace_logger_async_write(self):
         trace_dir = self.temp_dir / "traces"

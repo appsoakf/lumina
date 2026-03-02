@@ -1,0 +1,6 @@
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Local contributor notes
+AGENTS.md

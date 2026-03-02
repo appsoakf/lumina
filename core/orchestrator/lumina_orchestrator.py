@@ -11,7 +11,6 @@ from core.memory import MemoryService
 from core.orchestrator.task_graph import TaskGraph
 from core.protocols import CriticResult, ExecutorRunResult, OrchestrationResult, RoutingIntent, TaskState
 from core.tasks import TaskManager
-from core.workflows import TravelWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,6 @@ class LuminaOrchestrator:
         planner_agent: Optional[PlannerAgent] = None,
         executor_agent: Optional[ExecutorAgent] = None,
         critic_agent: Optional[CriticAgent] = None,
-        travel_workflow: Optional[TravelWorkflow] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         task_manager: Optional[TaskManager] = None,
         memory_service: Optional[MemoryService] = None,
@@ -38,7 +36,6 @@ class LuminaOrchestrator:
             "executor_agent": executor_agent or ExecutorAgent(),
             "critic_agent": critic_agent or CriticAgent(),
         }
-        self.travel_workflow = travel_workflow or TravelWorkflow()
         self.capabilities = capability_registry or build_default_registry()
         self.task_manager = task_manager or TaskManager()
         self.memory = memory_service or MemoryService()
@@ -360,50 +357,7 @@ class LuminaOrchestrator:
         _, planner_agent = self._resolve_agent("task_planning")
         _, critic_agent = self._resolve_agent("task_review")
 
-        workflow_mode = "general"
-        travel_constraints = None
-
-        if self.travel_workflow.is_match(user_text):
-            workflow_mode = "travel"
-            travel_constraints = self.travel_workflow.parse_constraints(user_text)
-            missing = self.travel_workflow.missing_required_fields(travel_constraints)
-            if missing:
-                clarification = self.travel_workflow.build_clarification_request(travel_constraints, missing)
-                self.task_manager.set_state(task_id, TaskState.PENDING)
-                self.task_manager.set_plan(task_id, {"workflow": "travel", "constraints": travel_constraints.to_dict()})
-
-                executor_result = ExecutorRunResult(
-                    output_text=clarification,
-                    tool_events=[],
-                    error=None,
-                    step_results=[],
-                )
-                final_reply = chat_agent.reply_with_task_result(
-                    user_text=user_text,
-                    executor_output=clarification,
-                    history=enriched_history,
-                )
-                meta = {
-                    "phase": "phase6",
-                    "task_id": task_id,
-                    "workflow": "travel",
-                    "need_clarification": True,
-                    "missing_fields": missing,
-                    "constraints": travel_constraints.to_dict(),
-                    "agent_chain": ["chat_agent", "workflow_guard", "chat_agent"],
-                    "task_mode": True,
-                    "task_error": False,
-                }
-                self._record_memory(session_id, user_id, user_text, final_reply, meta)
-                return OrchestrationResult(
-                    intent=RoutingIntent.TASK,
-                    final_reply=final_reply,
-                    executor_result=executor_result,
-                    meta=meta,
-                )
-            plan_result = self.travel_workflow.build_plan(user_text=user_text, constraints=travel_constraints)
-        else:
-            plan_result = planner_agent.plan_task(user_text=user_text, history=enriched_history)
+        plan_result = planner_agent.plan_task(user_text=user_text, history=enriched_history)
 
         self.task_manager.set_plan(task_id, plan_result.to_dict())
 
@@ -423,21 +377,7 @@ class LuminaOrchestrator:
             execution_graph=graph.to_dict(),
         )
 
-        if workflow_mode == "travel" and travel_constraints is not None:
-            workflow_review = self.travel_workflow.review(
-                constraints=travel_constraints,
-                graph_dict=graph.to_dict(),
-                critic=critic_result,
-            )
-            executor_output = self.travel_workflow.compose_executor_output(
-                constraints=travel_constraints,
-                graph_dict=graph.to_dict(),
-                critic=critic_result,
-                workflow_review=workflow_review,
-            )
-        else:
-            workflow_review = None
-            executor_output = self._compose_general_executor_output(graph=graph, critic=critic_result)
+        executor_output = self._compose_general_executor_output(graph=graph, critic=critic_result)
 
         executor_result = ExecutorRunResult(
             output_text=executor_output,
@@ -464,15 +404,11 @@ class LuminaOrchestrator:
             "task_id": task_id,
             "agent_chain": ["chat_agent", "planner_agent", "executor_agent", "critic_agent", "chat_agent"],
             "task_mode": True,
-            "workflow": workflow_mode,
             "plan": plan_result.to_dict(),
             "task_graph": graph.to_dict(),
             "critic": critic_result.to_dict(),
             "task_error": bool(run_info["first_error"]),
         }
-        if workflow_mode == "travel" and travel_constraints is not None:
-            meta["constraints"] = travel_constraints.to_dict()
-            meta["workflow_review"] = workflow_review
 
         self._record_memory(session_id, user_id, user_text, final_reply, meta)
         return OrchestrationResult(

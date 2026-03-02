@@ -4,7 +4,7 @@
 Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 多智能体编排（chat/planner/executor/critic）
 - 任务生命周期管理（create/query/cancel/retry）
-- 场景工作流（travel_workflow）
+- 通用任务链路（planner/executor/critic）
 - 本地记忆系统（Memory OS Lite，含可选向量检索）
 - 现有情感驱动 TTS 流式链路保持不变
 
@@ -101,7 +101,7 @@ Client
               -> QdrantVectorStore.search
               -> MemoryStore.get_by_ids
       -> ChatAgent.classify_intent => TASK
-      -> PlannerAgent / TravelWorkflow 生成计划
+      -> PlannerAgent 生成计划
       -> ExecutorAgent 执行步骤与工具调用
       -> CriticAgent 评审执行结果
       -> ChatAgent.reply_with_task_result 生成最终文本
@@ -123,7 +123,7 @@ Client
 | `LuminaOrchestrator.handle_user_message` | `user_text`, `history`, `session_id`, `user_id` | 指令判断（任务/记忆命令），记忆上下文注入，chat/task 路由，多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
 | `MemoryService.build_context` | `query` | 拉取 profile/commitment/relevant；启用向量时做 hybrid 检索并回退兜底 | 可注入 history 的 memory context 文本 |
 | `HybridMemoryRetriever.search`（可选） | `query`, `limit`, `memory_types` | 关键词召回 + 向量召回，按综合分重排（vector/keyword/recency/type） | 相关记忆列表（TopK） |
-| `PlannerAgent` / `TravelWorkflow` | 任务请求 + 约束 | 拆解执行步骤，生成 plan | `PlanResult(goal, steps)` |
+| `PlannerAgent` | 任务请求 + 历史上下文 | 拆解执行步骤，生成 plan | `PlanResult(goal, steps)` |
 | `ExecutorAgent` | 单步任务输入 + 工具上下文 | 多轮 function calling，执行工具并汇总 step result | `ExecutorRunResult(output_text, tool_events, error)` |
 | `CriticAgent` | `user_text`, `plan`, `execution_graph` | 质量评审，给出 `pass/revise` 与建议 | `CriticResult` |
 | `ChatAgent.reply_with_task_result` | 用户请求 + 执行总结 + history | 组织最终可读回复，补齐情绪 JSON 格式 | 最终回复文本（首行情绪 JSON） |

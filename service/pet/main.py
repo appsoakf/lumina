@@ -250,7 +250,6 @@ def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, t
                 "tool_events": len(tool_events),
                 "route_intent": orchestrated.intent.value,
                 "task_id": orchestrated.meta.get("task_id"),
-                "workflow": orchestrated.meta.get("workflow"),
                 "phase": orchestrated.meta.get("phase"),
             },
         )
