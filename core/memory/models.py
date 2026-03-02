@@ -23,6 +23,7 @@ class MemoryRecord:
     session_id: str
     memory_type: MemoryType
     content: str
+    content_hash: str = ""
     tags: str = ""
     confidence: float = 1.0
     ttl_seconds: Optional[int] = None
@@ -38,6 +39,7 @@ class MemoryRecord:
             "session_id": self.session_id,
             "memory_type": self.memory_type.value,
             "content": self.content,
+            "content_hash": self.content_hash,
             "tags": self.tags,
             "confidence": self.confidence,
             "ttl_seconds": self.ttl_seconds,

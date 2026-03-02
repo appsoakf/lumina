@@ -40,10 +40,28 @@ class ServiceConfig:
 
 
 @dataclass
+class MemoryVectorConfig:
+    enabled: bool
+    provider: str
+    embedding_model: str
+    embedding_api_url: str
+    embedding_api_key: str
+    qdrant_url: str
+    qdrant_collection: str
+    vector_dim: int
+    top_k_vector: int
+    top_k_keyword: int
+    write_async: bool
+    queue_size: int
+    max_retries: int
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig
     tts: TTSConfig
     service: ServiceConfig
+    memory_vector: MemoryVectorConfig
 
 
 def _load_json(path: Path) -> dict:
@@ -70,6 +88,24 @@ def _to_int(value, path: str) -> int:
             "Invalid integer config value",
             details={"field": path, "value": value},
         )
+
+
+def _to_bool(value, path: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise LuminaError(
+        ErrorCode.CONFIG_INVALID,
+        "Invalid boolean config value",
+        details={"field": path, "value": value},
+    )
 
 
 def _build_llm_config(raw: dict) -> LLMConfig:
@@ -147,6 +183,73 @@ def _build_service_config(raw: dict) -> ServiceConfig:
     return cfg
 
 
+def _build_memory_vector_config(service_raw: dict, llm_raw: dict) -> MemoryVectorConfig:
+    mv = service_raw.get("memory_vector", {}) or {}
+
+    enabled_raw = os.environ.get("LUMINA_MEMORY_VECTOR_ENABLED", mv.get("enabled", False))
+    enabled = _to_bool(enabled_raw, "memory_vector.enabled")
+
+    cfg = MemoryVectorConfig(
+        enabled=enabled,
+        provider=str(os.environ.get("LUMINA_MEMORY_VECTOR_PROVIDER", mv.get("provider", "openai"))).strip() or "openai",
+        embedding_model=str(
+            os.environ.get("LUMINA_EMBEDDING_MODEL", mv.get("embedding_model", "text-embedding-3-small"))
+        ).strip(),
+        embedding_api_url=str(
+            os.environ.get("LUMINA_EMBEDDING_API_URL", mv.get("embedding_api_url", llm_raw.get("chat_api_url", "")))
+        ).strip(),
+        embedding_api_key=str(
+            os.environ.get(
+                "LUMINA_EMBEDDING_API_KEY",
+                os.environ.get("LUMINA_API_KEY", mv.get("embedding_api_key", llm_raw.get("chat_api_key", ""))),
+            )
+        ).strip(),
+        qdrant_url=str(os.environ.get("LUMINA_QDRANT_URL", mv.get("qdrant_url", "http://127.0.0.1:6333"))).strip(),
+        qdrant_collection=str(
+            os.environ.get("LUMINA_QDRANT_COLLECTION", mv.get("qdrant_collection", "lumina_memory_vectors"))
+        ).strip(),
+        vector_dim=_to_int(os.environ.get("LUMINA_VECTOR_DIM", mv.get("vector_dim", 1536)), "memory_vector.vector_dim"),
+        top_k_vector=_to_int(
+            os.environ.get("LUMINA_VECTOR_TOP_K", mv.get("top_k_vector", 12)),
+            "memory_vector.top_k_vector",
+        ),
+        top_k_keyword=_to_int(
+            os.environ.get("LUMINA_KEYWORD_TOP_K", mv.get("top_k_keyword", 12)),
+            "memory_vector.top_k_keyword",
+        ),
+        write_async=_to_bool(
+            os.environ.get("LUMINA_VECTOR_WRITE_ASYNC", mv.get("write_async", True)),
+            "memory_vector.write_async",
+        ),
+        queue_size=_to_int(
+            os.environ.get("LUMINA_VECTOR_QUEUE_SIZE", mv.get("queue_size", 512)),
+            "memory_vector.queue_size",
+        ),
+        max_retries=_to_int(
+            os.environ.get("LUMINA_VECTOR_MAX_RETRIES", mv.get("max_retries", 3)),
+            "memory_vector.max_retries",
+        ),
+    )
+
+    if cfg.enabled:
+        required = {
+            "memory_vector.embedding_model": cfg.embedding_model,
+            "memory_vector.embedding_api_url": cfg.embedding_api_url,
+            "memory_vector.embedding_api_key": cfg.embedding_api_key,
+            "memory_vector.qdrant_url": cfg.qdrant_url,
+            "memory_vector.qdrant_collection": cfg.qdrant_collection,
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            raise LuminaError(
+                ErrorCode.CONFIG_MISSING,
+                "Missing required memory vector config fields",
+                details={"fields": missing},
+            )
+
+    return cfg
+
+
 @lru_cache(maxsize=1)
 def load_app_config() -> AppConfig:
     llm_raw = _load_json(ROOT_DIR / "core" / "llm" / "config.json")
@@ -157,4 +260,5 @@ def load_app_config() -> AppConfig:
         llm=_build_llm_config(llm_raw),
         tts=_build_tts_config(tts_raw),
         service=_build_service_config(service_raw),
+        memory_vector=_build_memory_vector_config(service_raw, llm_raw),
     )

@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -30,6 +31,7 @@ class MemoryStore:
                     session_id TEXT NOT NULL,
                     memory_type TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    content_hash TEXT DEFAULT '',
                     tags TEXT DEFAULT '',
                     confidence REAL DEFAULT 1.0,
                     ttl_seconds INTEGER,
@@ -40,11 +42,21 @@ class MemoryStore:
                 )
                 """
             )
+            self._ensure_column(conn, "content_hash", "TEXT DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_type ON memories(user_id, memory_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_created ON memories(user_id, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_hash ON memories(user_id, memory_type, content_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_type_created ON memories(memory_type, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_type_hash ON memories(memory_type, content_hash)")
             conn.commit()
         finally:
             conn.close()
+
+    def _ensure_column(self, conn: sqlite3.Connection, name: str, ddl: str) -> None:
+        rows = conn.execute("PRAGMA table_info(memories)").fetchall()
+        names = {r[1] for r in rows}
+        if name not in names:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
 
     def add(self, record: MemoryRecord) -> int:
         conn = self._connect()
@@ -53,15 +65,16 @@ class MemoryStore:
             cur = conn.execute(
                 """
                 INSERT INTO memories(
-                    user_id, session_id, memory_type, content, tags,
+                    user_id, session_id, memory_type, content, content_hash, tags,
                     confidence, ttl_seconds, source, payload, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.user_id,
                     record.session_id,
                     record.memory_type.value,
                     record.content,
+                    record.content_hash,
                     record.tags,
                     record.confidence,
                     record.ttl_seconds,
@@ -78,59 +91,173 @@ class MemoryStore:
 
     def list_recent(
         self,
-        user_id: str,
+        user_id: Optional[str] = None,
         memory_type: Optional[MemoryType] = None,
         limit: int = 20,
     ) -> List[Dict]:
         conn = self._connect()
         try:
+            fetch_limit = max(limit * 3, limit)
             if memory_type is None:
                 rows = conn.execute(
                     """
                     SELECT * FROM memories
-                    WHERE user_id = ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (user_id, limit),
+                    (fetch_limit,),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """
                     SELECT * FROM memories
-                    WHERE user_id = ? AND memory_type = ?
+                    WHERE memory_type = ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (user_id, memory_type.value, limit),
+                    (memory_type.value, fetch_limit),
                 ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            result = [self._row_to_dict(r) for r in rows]
+            result = [r for r in result if not self._is_expired(r)]
+            return result[:limit]
         finally:
             conn.close()
 
-    def search(self, user_id: str, query: str, limit: int = 8, memory_types: Optional[List[MemoryType]] = None) -> List[Dict]:
+    def search(
+        self,
+        user_id: Optional[str] = None,
+        query: str = "",
+        limit: int = 8,
+        memory_types: Optional[List[MemoryType]] = None,
+    ) -> List[Dict]:
         conn = self._connect()
         try:
+            fetch_limit = max(limit * 4, limit)
             like = f"%{query}%"
             if memory_types:
                 placeholders = ",".join(["?"] * len(memory_types))
                 sql = (
-                    "SELECT * FROM memories WHERE user_id = ? AND (content LIKE ? OR tags LIKE ?) "
+                    "SELECT * FROM memories WHERE (content LIKE ? OR tags LIKE ?) "
                     f"AND memory_type IN ({placeholders}) ORDER BY id DESC LIMIT ?"
                 )
-                params = [user_id, like, like] + [m.value for m in memory_types] + [limit]
+                params = [like, like] + [m.value for m in memory_types] + [fetch_limit]
                 rows = conn.execute(sql, tuple(params)).fetchall()
             else:
                 rows = conn.execute(
                     """
                     SELECT * FROM memories
-                    WHERE user_id = ? AND (content LIKE ? OR tags LIKE ?)
+                    WHERE (content LIKE ? OR tags LIKE ?)
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (user_id, like, like, limit),
+                    (like, like, fetch_limit),
                 ).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            result = [self._row_to_dict(r) for r in rows]
+            result = [r for r in result if not self._is_expired(r)]
+            return result[:limit]
+        finally:
+            conn.close()
+
+    def exists_recent_duplicate(
+        self,
+        user_id: Optional[str],
+        memory_type: MemoryType,
+        content_hash: str,
+        window_seconds: int,
+    ) -> bool:
+        return self.find_recent_duplicate_id(
+            user_id=user_id,
+            memory_type=memory_type,
+            content_hash=content_hash,
+            window_seconds=window_seconds,
+        ) is not None
+
+    def find_recent_duplicate_id(
+        self,
+        user_id: Optional[str],
+        memory_type: MemoryType,
+        content_hash: str,
+        window_seconds: int,
+    ) -> Optional[int]:
+        if not content_hash:
+            return None
+
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, ttl_seconds, content_hash
+                FROM memories
+                WHERE memory_type = ? AND content_hash = ?
+                ORDER BY id DESC
+                LIMIT 30
+                """,
+                (memory_type.value, content_hash),
+            ).fetchall()
+
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                item = {
+                    "memory_id": row["id"],
+                    "created_at": row["created_at"],
+                    "ttl_seconds": row["ttl_seconds"],
+                    "content_hash": row["content_hash"],
+                }
+                if self._is_expired(item):
+                    continue
+                created = self._parse_dt(row["created_at"])
+                if created is None:
+                    continue
+                if now - created <= timedelta(seconds=max(window_seconds, 0)):
+                    return int(row["id"])
+            return None
+        finally:
+            conn.close()
+
+    def get_by_ids(self, memory_ids: List[int]) -> Dict[int, Dict]:
+        if not memory_ids:
+            return {}
+
+        ids = [int(i) for i in memory_ids]
+        placeholders = ",".join(["?"] * len(ids))
+        conn = self._connect()
+        try:
+            rows = conn.execute(f"SELECT * FROM memories WHERE id IN ({placeholders})", tuple(ids)).fetchall()
+            out: Dict[int, Dict] = {}
+            for row in rows:
+                mapped = self._row_to_dict(row)
+                if self._is_expired(mapped):
+                    continue
+                out[int(mapped["memory_id"])] = mapped
+            return out
+        finally:
+            conn.close()
+
+    def purge_expired(self, user_id: Optional[str] = None) -> int:
+        return len(self.purge_expired_ids(user_id=user_id))
+
+    def purge_expired_ids(self, user_id: Optional[str] = None) -> List[int]:
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT id, created_at, ttl_seconds FROM memories").fetchall()
+
+            expired_ids: List[int] = []
+            for row in rows:
+                if self._is_expired(
+                    {
+                        "created_at": row["created_at"],
+                        "ttl_seconds": row["ttl_seconds"],
+                    }
+                ):
+                    expired_ids.append(int(row["id"]))
+
+            if not expired_ids:
+                return []
+
+            placeholders = ",".join(["?"] * len(expired_ids))
+            conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", tuple(expired_ids))
+            conn.commit()
+            return expired_ids
         finally:
             conn.close()
 
@@ -157,6 +284,7 @@ class MemoryStore:
             "session_id": row["session_id"],
             "memory_type": row["memory_type"],
             "content": row["content"],
+            "content_hash": row["content_hash"] or "",
             "tags": row["tags"],
             "confidence": row["confidence"],
             "ttl_seconds": row["ttl_seconds"],
@@ -165,3 +293,29 @@ class MemoryStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _parse_dt(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    def _is_expired(self, record: Dict) -> bool:
+        ttl = record.get("ttl_seconds")
+        if ttl is None:
+            return False
+        try:
+            ttl_int = int(ttl)
+        except Exception:
+            return False
+        if ttl_int <= 0:
+            return True
+        created = self._parse_dt(record.get("created_at"))
+        if created is None:
+            return False
+        return datetime.now(timezone.utc) > created + timedelta(seconds=ttl_int)

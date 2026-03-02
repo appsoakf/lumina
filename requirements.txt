@@ -3,3 +3,4 @@ flask-sock
 openai
 requests
 pydantic
+qdrant-client

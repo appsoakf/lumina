@@ -21,3 +21,17 @@ class MemoryPolicy:
         if memory_type == MemoryType.COMMITMENT:
             return 30 * 24 * 3600
         return None
+
+    def dedupe_window_seconds(self, memory_type: MemoryType) -> int:
+        if memory_type == MemoryType.PROFILE:
+            return 90 * 24 * 3600
+        if memory_type == MemoryType.COMMITMENT:
+            return 24 * 3600
+        if memory_type == MemoryType.EPISODIC:
+            return 2 * 3600
+        if memory_type == MemoryType.PROCEDURAL:
+            return 7 * 24 * 3600
+        return 24 * 3600
+
+    def cleanup_interval_seconds(self) -> int:
+        return 10 * 60
