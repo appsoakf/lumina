@@ -1,7 +1,7 @@
-# Lumina 架构文档（Phase 6）
+# Lumina 架构文档
 
 ## 1. 项目定位
-Lumina 是一个本地部署的实时 AI 语音助手框架。当前 Phase 6 已实现：
+Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 多智能体编排（chat/planner/executor/critic）
 - 任务生命周期管理（create/query/cancel/retry）
 - 场景工作流（travel_workflow）
@@ -31,7 +31,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前 Phase 6 已
 - `procedural`（任务流程经验）
 - `artifact`（预留）
 
-## 3. Orchestrator（Phase 6）
+## 3. Orchestrator
 `core/orchestrator/lumina_orchestrator.py` 新能力：
 1. 每轮请求前：注入记忆上下文到 agent history（个性化与连续性）
 2. 每轮请求后：自动沉淀记忆（偏好、待办、会话摘要、流程经验）
@@ -82,3 +82,57 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前 Phase 6 已
 - 向量检索是增强层：SQLite 仍是主数据源，Qdrant 仅做检索索引
 - 未引入权限白名单与执行防护（遵循 Phase 4-Lite 约束）
 - 后续可增量扩展：超时预算/熔断、索引回填、召回阈值与可观测性
+
+## 9. 数据流示意（示例）
+示例用户输入：
+`帮我规划一个北京3日游，预算3000元。另外记住我喜欢博物馆和清淡饮食。`
+
+### 9.1 端到端示意图
+```text
+Client
+  -> WS(/ws)
+  -> service.pet.main.websocket_handler
+  -> handle_bot_reply
+  -> LuminaOrchestrator.handle_user_message
+      -> MemoryService.build_context
+          -> (keyword) MemoryRetriever
+          -> (optional) HybridMemoryRetriever
+              -> EmbeddingProvider.embed(query)
+              -> QdrantVectorStore.search
+              -> MemoryStore.get_by_ids
+      -> ChatAgent.classify_intent => TASK
+      -> PlannerAgent / TravelWorkflow 生成计划
+      -> ExecutorAgent 执行步骤与工具调用
+      -> CriticAgent 评审执行结果
+      -> ChatAgent.reply_with_task_result 生成最终文本
+      -> MemoryService.ingest_turn
+          -> MemoryPolicy + MemoryIngestor
+          -> MemoryStore.add (SQLite)
+          -> MemoryVectorIndexer.enqueue (async)
+              -> EmbeddingProvider.embed(content)
+              -> QdrantVectorStore.upsert
+  -> EmotionEngine + TranslateEngine + TTSEngine
+  -> WS audio/text streaming response
+```
+
+### 9.2 模块级输入/处理/输出
+
+| 模块 | 输入 | 处理 | 输出 |
+|---|---|---|---|
+| `websocket_handler` / `handle_bot_reply` | WS JSON：`{"content": "..."} ` | 解析文本、维护会话 `history/session_id`、调用 orchestrator | `orchestrated.final_reply` + 流式音频输出 |
+| `LuminaOrchestrator.handle_user_message` | `user_text`, `history`, `session_id`, `user_id` | 指令判断（任务/记忆命令），记忆上下文注入，chat/task 路由，多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
+| `MemoryService.build_context` | `query` | 拉取 profile/commitment/relevant；启用向量时做 hybrid 检索并回退兜底 | 可注入 history 的 memory context 文本 |
+| `HybridMemoryRetriever.search`（可选） | `query`, `limit`, `memory_types` | 关键词召回 + 向量召回，按综合分重排（vector/keyword/recency/type） | 相关记忆列表（TopK） |
+| `PlannerAgent` / `TravelWorkflow` | 任务请求 + 约束 | 拆解执行步骤，生成 plan | `PlanResult(goal, steps)` |
+| `ExecutorAgent` | 单步任务输入 + 工具上下文 | 多轮 function calling，执行工具并汇总 step result | `ExecutorRunResult(output_text, tool_events, error)` |
+| `CriticAgent` | `user_text`, `plan`, `execution_graph` | 质量评审，给出 `pass/revise` 与建议 | `CriticResult` |
+| `ChatAgent.reply_with_task_result` | 用户请求 + 执行总结 + history | 组织最终可读回复，补齐情绪 JSON 格式 | 最终回复文本（首行情绪 JSON） |
+| `MemoryService.ingest_turn` | `user_text`, `assistant_reply`, `meta` | 抽取 profile/commitment/episodic/procedural，去重后写入 SQLite | 新增 memory 记录 ID（可多条） |
+| `MemoryVectorIndexer`（可选） | `memory_id`, `content`, payload | 异步 embedding + Qdrant upsert，失败重试 | 向量索引点位（不阻塞主链路） |
+| `Emotion/Translate/TTS` | 最终回复文本 | 情绪解析 -> 逐句翻译 -> 逐句 TTS 流式合成 | `emotion_text` + `audio_chunk` + `audio_done` |
+
+### 9.3 本示例下的关键结果
+1. 请求被识别为 `TASK`，生成“北京 3 日游”计划并执行。
+2. “喜欢博物馆/清淡饮食”被抽取为 `profile`，写入 SQLite。
+3. 若启用向量检索，该条 profile 会异步写入 Qdrant，供后续语义检索使用。
+4. 下次请求 `build_context` 会优先注入这些偏好，影响规划与回复风格。
