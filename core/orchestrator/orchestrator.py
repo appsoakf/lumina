@@ -1,6 +1,5 @@
 import logging
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from core.agentic.chat_agent import ChatAgent
 from core.agentic.critic_agent import CriticAgent
@@ -9,6 +8,7 @@ from core.agentic.planner_agent import PlannerAgent
 from core.capabilities import CapabilityRegistry, build_default_registry
 from core.memory import MemoryService
 from core.orchestrator.task_graph import TaskGraph
+from core.orchestrator.task_shortcuts import execute_task_shortcut
 from core.protocols import CriticResult, ExecutorRunResult, OrchestrationResult, RoutingIntent, TaskState
 from core.tasks import TaskManager
 
@@ -16,9 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Phase 6 orchestrator: dynamic routing + task lifecycle + memory system."""
-
-    TASK_ID_RE = re.compile(r"(t-[0-9]{14}-[a-f0-9]{8})", re.IGNORECASE)
+    """Orchestrator: dynamic routing + task lifecycle + memory system."""
 
     def __init__(
         self,
@@ -184,143 +182,19 @@ class Orchestrator:
                 lines.append(f"- {s}")
         return "\n".join(lines)
 
-    def _extract_task_command(self, user_text: str) -> Optional[Tuple[str, str]]:
-        text = user_text.strip()
-        task_id_match = self.TASK_ID_RE.search(text)
-        task_id = task_id_match.group(1) if task_id_match else ""
-
-        if text.startswith("查询任务") or text.lower().startswith("task_status"):
-            return ("query", task_id)
-        if text.startswith("取消任务") or text.lower().startswith("task_cancel"):
-            return ("cancel", task_id)
-        if text.startswith("重试任务") or text.lower().startswith("task_retry"):
-            return ("retry", task_id)
-        return None
-
-    def _format_task_status(self, task_id: str) -> str:
-        if not task_id:
-            return "未识别到任务ID，请提供形如 t-YYYYMMDDHHMMSS-xxxxxxxx 的任务号。"
-        task = self._task_manager.get_task(task_id)
-        if not task:
-            return f"未找到任务 {task_id}。"
-
-        lines = [f"任务ID: {task.task_id}", f"状态: {task.state.value}", f"更新时间: {task.updated_at}"]
-        if task.error:
-            lines.append(f"错误: {task.error.get('code')} | {task.error.get('message')}")
-        if task.step_results:
-            lines.append("步骤摘要:")
-            for s in task.step_results[-5:]:
-                lines.append(f"- [{s.get('step_id')}] {s.get('state')} | {s.get('title')}")
-        return "\n".join(lines)
-
-    def _handle_task_command(
+    def _handle_task_shortcut(
         self,
         user_text: str,
-        history: List[Dict[str, str]],
-    ) -> Optional[OrchestrationResult]:
-        cmd = self._extract_task_command(user_text)
-        if not cmd:
-            return None
-
-        action, task_id = cmd
-        _, chat_agent = self._resolve_agent("chat")
-
-        if action == "query":
-            status_text = self._format_task_status(task_id)
-        elif action == "cancel":
-            ok = self._task_manager.cancel_task(task_id) if task_id else False
-            status_text = f"任务 {task_id} 已取消。" if ok else f"取消失败，任务 {task_id or '(缺失ID)'} 不可取消或不存在。"
-        elif action == "retry":
-            task = self._task_manager.retry_task(task_id) if task_id else None
-            status_text = (
-                f"任务 {task_id} 已重置为 pending，可再次执行。" if task else f"重试失败，任务 {task_id or '(缺失ID)'} 不存在。"
-            )
-        else:
-            status_text = "未知任务指令。"
-
-        final_reply = chat_agent.reply_with_task_result(
-            user_text=user_text,
-            executor_output=status_text,
-            history=history,
-        )
-
-        return OrchestrationResult(
-            intent=RoutingIntent.CHAT,
-            final_reply=final_reply,
-            executor_result=None,
-            meta={
-                "phase": "phase6",
-                "task_command": action,
-                "task_id": task_id,
-                "task_mode": False,
-                "agent_chain": ["chat_agent"],
-            },
-        )
-
-    def _handle_memory_command(
-        self,
-        user_text: str,
-        history: List[Dict[str, str]],
         session_id: str,
-        user_id: str,
+        history: List[Dict[str, str]],
     ) -> Optional[OrchestrationResult]:
-        cmd = self._memory.parse_memory_command(user_text)
-        if not cmd:
-            return None
-
         _, chat_agent = self._resolve_agent("chat")
-        action = cmd.get("action", "")
-
-        if action == "remember":
-            value = (cmd.get("value") or "").strip()
-            if not value:
-                result_text = "请在“记住”后提供要保存的信息。"
-            else:
-                memory_id = self._memory.remember(user_id=user_id, session_id=session_id, content=value)
-                result_text = f"已记住（#{memory_id}）：{value}"
-        elif action == "list_profile":
-            rows = self._memory.list_profile(user_id=user_id, limit=8)
-            if not rows:
-                result_text = "当前还没有已记录的偏好记忆。"
-            else:
-                lines = ["你的偏好记忆："]
-                for r in rows:
-                    lines.append(f"- #{r.get('memory_id')} {r.get('content')}")
-                result_text = "\n".join(lines)
-        elif action == "list_commitments":
-            rows = self._memory.list_commitments(user_id=user_id, limit=8)
-            if not rows:
-                result_text = "当前没有未完成待办。"
-            else:
-                lines = ["你的未完成待办："]
-                for r in rows:
-                    due = (r.get("payload") or {}).get("due", "")
-                    suffix = f" (截止:{due})" if due else ""
-                    lines.append(f"- #{r.get('memory_id')} {r.get('content')}{suffix}")
-                result_text = "\n".join(lines)
-        elif action == "close_commitment":
-            memory_id = int(cmd.get("memory_id"))
-            ok = self._memory.close_commitment(user_id=user_id, memory_id=memory_id)
-            result_text = f"待办 #{memory_id} 已标记完成。" if ok else f"未找到待办 #{memory_id}。"
-        else:
-            result_text = "未知记忆指令。"
-
-        final_reply = chat_agent.reply_with_task_result(
+        return execute_task_shortcut(
             user_text=user_text,
-            executor_output=result_text,
+            session_id=session_id,
             history=history,
-        )
-
-        return OrchestrationResult(
-            intent=RoutingIntent.CHAT,
-            final_reply=final_reply,
-            executor_result=None,
-            meta={
-                "phase": "phase6",
-                "memory_command": action,
-                "task_mode": False,
-                "agent_chain": ["chat_agent", "memory_service", "chat_agent"],
-            },
+            task_manager=self._task_manager,
+            chat_agent=chat_agent,
         )
 
     def handle_user_message(
@@ -331,31 +205,25 @@ class Orchestrator:
     ) -> OrchestrationResult:
         history = self._memory.get_recent_history(session_id=session_id)
 
-        # task lifecycle commands
-        command_result = self._handle_task_command(user_text=user_text, history=history)
-        if command_result is not None:
-            self._record_memory(session_id, user_id, user_text, command_result.final_reply, command_result.meta)
-            return command_result
-
-        # memory commands
-        memory_result = self._handle_memory_command(
+        # task shortcuts, e.g. /cancel and /retry
+        shortcut_result = self._handle_task_shortcut(
             user_text=user_text,
-            history=history,
             session_id=session_id,
-            user_id=user_id,
+            history=history,
         )
-        if memory_result is not None:
-            self._record_memory(session_id, user_id, user_text, memory_result.final_reply, memory_result.meta)
-            return memory_result
+        if shortcut_result is not None:
+            self._record_memory(session_id, user_id, user_text, shortcut_result.final_reply, shortcut_result.meta)
+            return shortcut_result
 
         enriched_history = self._augment_history_with_memory(history=history, user_id=user_id, query=user_text)
 
+        # 意图识别
         _, chat_agent = self._resolve_agent("chat")
         intent = chat_agent.classify_intent(user_text=user_text, history=enriched_history)
 
         if intent == RoutingIntent.CHAT:
             final_reply = chat_agent.reply_chat(user_text=user_text, history=enriched_history)
-            meta = {"agent_chain": ["chat_agent"], "task_mode": False, "phase": "phase6"}
+            meta = {"agent_chain": ["chat_agent"], "task_mode": False}
             self._record_memory(session_id, user_id, user_text, final_reply, meta)
             return OrchestrationResult(
                 intent=RoutingIntent.CHAT,
@@ -364,7 +232,7 @@ class Orchestrator:
                 meta=meta,
             )
 
-        # task mode (phase6)
+        # task mode
         task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
         task_id = task.task_id
         self._task_manager.set_state(task_id, TaskState.RUNNING)
@@ -415,7 +283,6 @@ class Orchestrator:
         )
 
         meta = {
-            "phase": "phase6",
             "task_id": task_id,
             "agent_chain": ["chat_agent", "planner_agent", "executor_agent", "critic_agent", "chat_agent"],
             "task_mode": True,

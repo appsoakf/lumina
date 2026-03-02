@@ -1,5 +1,4 @@
 import logging
-import re
 import time
 from hashlib import sha1
 from typing import Dict, List, Optional
@@ -14,6 +13,7 @@ from core.memory.policy import MemoryPolicy
 from core.memory.retriever import MemoryRetriever
 from core.memory.short_term_store import ShortTermMemoryStore
 from core.memory.store import LongTermMemoryStore
+from core.memory.turn_summarizer import AsyncTurnSummarizer, TurnSummary, TurnSummaryExtractor
 from core.memory.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,8 @@ class MemoryService:
         policy: Optional[MemoryPolicy] = None,
         ingestor: Optional[MemoryIngestor] = None,
         short_term_store: Optional[ShortTermMemoryStore] = None,
+        turn_summary_extractor: Optional[TurnSummaryExtractor] = None,
+        turn_summarizer: Optional[AsyncTurnSummarizer] = None,
         short_history_limit: int = 24,
         default_user_id: str = "default",
     ):
@@ -56,6 +58,13 @@ class MemoryService:
             enabled=self.vector_cfg.enabled and self.vector_cfg.write_async,
             queue_size=self.vector_cfg.queue_size,
             max_retries=self.vector_cfg.max_retries,
+        )
+        self.turn_summary_extractor = turn_summary_extractor or TurnSummaryExtractor(ingestor=self.ingestor)
+        self.turn_summarizer = turn_summarizer or AsyncTurnSummarizer(
+            extractor=self.turn_summary_extractor,
+            on_summary=self._persist_turn_summary,
+            enabled=True,
+            queue_size=256,
         )
 
     def get_recent_history(self, session_id: str, limit_messages: Optional[int] = None) -> List[Dict[str, str]]:
@@ -86,45 +95,6 @@ class MemoryService:
             history.append({"role": "assistant", "content": assistant_reply})
         self.short_term_store.save_round(session_id=session_id, history=history, metadata=metadata or {})
         return self.get_recent_history(session_id=session_id, limit_messages=None)
-
-    def remember(self, user_id: str = "", session_id: str = "", content: str = "", tags: str = "") -> int:
-        self._maybe_cleanup()
-        rec = MemoryRecord(
-            memory_id=None,
-            user_id=self.default_user_id,
-            session_id=session_id,
-            memory_type=MemoryType.PROFILE,
-            content=content,
-            tags=tags or "profile,manual",
-            ttl_seconds=self.policy.default_ttl_seconds(MemoryType.PROFILE),
-            source="manual",
-            payload={},
-        )
-        return self._add_if_not_duplicate(rec)
-
-    def list_profile(self, user_id: str = "", limit: int = 8) -> List[Dict]:
-        self._maybe_cleanup()
-        return self.retriever.get_profile(limit=limit)
-
-    def list_commitments(self, user_id: str = "", limit: int = 10) -> List[Dict]:
-        self._maybe_cleanup()
-        return self.retriever.get_open_commitments(limit=limit)
-
-    def close_commitment(self, user_id: str = "", memory_id: int = 0) -> bool:
-        self._maybe_cleanup()
-        rows = self.long_term_store.list_recent(memory_type=MemoryType.COMMITMENT, limit=50)
-        target = None
-        for r in rows:
-            if int(r.get("memory_id", -1)) == int(memory_id):
-                target = r
-                break
-        if not target:
-            return False
-
-        payload = target.get("payload") or {}
-        payload["status"] = "done"
-        self.long_term_store.update_payload(memory_id=memory_id, payload=payload)
-        return True
 
     def build_context(self, user_id: str = "", query: str = "") -> str:
         self._maybe_cleanup()
@@ -174,21 +144,17 @@ class MemoryService:
         _ = user_id  # kept for backward-compatible call signature
         self._maybe_cleanup()
         effective_user_id = self.default_user_id
-        # profile memory
-        if self.policy.should_store_profile(user_text):
-            for c in self.ingestor.extract_profile_candidates(user_text):
-                rec = MemoryRecord(
-                    memory_id=None,
-                    user_id=effective_user_id,
-                    session_id=session_id,
-                    memory_type=MemoryType.PROFILE,
-                    content=c["content"],
-                    tags=c.get("tags", "profile"),
-                    ttl_seconds=self.policy.default_ttl_seconds(MemoryType.PROFILE),
-                    source="user_utterance",
-                    payload={"meta": meta or {}},
-                )
-                self._add_if_not_duplicate(rec)
+
+        turn_item = self._build_turn_summary_item(
+            session_id=session_id,
+            user_id=effective_user_id,
+            user_text=user_text,
+            assistant_reply=assistant_reply,
+            meta=meta,
+        )
+        if not self.turn_summarizer.enqueue(turn_item):
+            summary = self.turn_summary_extractor.summarize(user_text=user_text, assistant_reply=assistant_reply)
+            self._persist_turn_summary(summary, turn_item)
 
         # commitment memory
         if self.policy.should_store_commitment(user_text):
@@ -206,22 +172,6 @@ class MemoryService:
                 )
                 self._add_if_not_duplicate(rec)
 
-        # episodic summary
-        if self.policy.should_store_episode(user_text):
-            content = f"USER:{user_text} | ASSISTANT:{assistant_reply[:180]}"
-            rec = MemoryRecord(
-                memory_id=None,
-                user_id=effective_user_id,
-                session_id=session_id,
-                memory_type=MemoryType.EPISODIC,
-                content=content,
-                tags="episodic,turn",
-                ttl_seconds=self.policy.default_ttl_seconds(MemoryType.EPISODIC),
-                source="dialog_turn",
-                payload={"meta": meta or {}},
-            )
-            self._add_if_not_duplicate(rec)
-
         # procedural capture for successful tasks
         if meta and meta.get("task_mode") and meta.get("task_id") and not meta.get("task_error"):
             plan = meta.get("plan")
@@ -238,24 +188,101 @@ class MemoryService:
                 )
                 self._add_if_not_duplicate(rec)
 
-    def parse_memory_command(self, text: str) -> Optional[Dict]:
-        t = text.strip()
+    def _build_turn_summary_item(
+        self,
+        session_id: str,
+        user_id: str,
+        user_text: str,
+        assistant_reply: str,
+        meta: Optional[Dict],
+    ) -> Dict[str, object]:
+        return {
+            "session_id": session_id,
+            "user_id": user_id,
+            "user_text": user_text or "",
+            "assistant_reply": assistant_reply or "",
+            "meta": meta or {},
+        }
 
-        if t.startswith("记住"):
-            value = re.sub(r"^记住[:：]?", "", t).strip()
-            return {"action": "remember", "value": value}
+    def _persist_turn_summary(self, summary: TurnSummary, item: Dict[str, object]) -> None:
+        try:
+            self._maybe_cleanup()
+            session_id = str(item.get("session_id", "")).strip()
+            user_id = str(item.get("user_id", self.default_user_id)).strip() or self.default_user_id
+            user_text = str(item.get("user_text", ""))
+            assistant_reply = str(item.get("assistant_reply", ""))
+            meta_obj = item.get("meta")
+            meta = meta_obj if isinstance(meta_obj, dict) else {}
 
-        if t.startswith("我的偏好") or t.startswith("查看记忆"):
-            return {"action": "list_profile"}
+            self._persist_profile_candidates(
+                user_id=user_id,
+                session_id=session_id,
+                candidates=summary.profile_candidates,
+                meta=meta,
+                topic=summary.topic,
+            )
+            self._persist_topic_summary(
+                user_id=user_id,
+                session_id=session_id,
+                user_text=user_text,
+                assistant_reply=assistant_reply,
+                topic=summary.topic,
+                meta=meta,
+            )
+        except Exception as exc:
+            logger.warning(f"Turn summary persist skipped due to error: {exc}")
 
-        if t.startswith("我的待办") or t.startswith("查看待办"):
-            return {"action": "list_commitments"}
+    def _persist_profile_candidates(
+        self,
+        user_id: str,
+        session_id: str,
+        candidates: List[str],
+        meta: Dict,
+        topic: str,
+    ) -> None:
+        for value in candidates:
+            content = str(value).strip()
+            if not content:
+                continue
+            rec = MemoryRecord(
+                memory_id=None,
+                user_id=user_id,
+                session_id=session_id,
+                memory_type=MemoryType.PROFILE,
+                content=content,
+                tags="profile,preference,auto",
+                ttl_seconds=self.policy.default_ttl_seconds(MemoryType.PROFILE),
+                source="turn_summary",
+                payload={"meta": meta, "topic": topic},
+            )
+            self._add_if_not_duplicate(rec)
 
-        m = re.search(r"完成待办\s*#?(\d+)", t)
-        if m:
-            return {"action": "close_commitment", "memory_id": int(m.group(1))}
+    def _persist_topic_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        user_text: str,
+        assistant_reply: str,
+        topic: str,
+        meta: Dict,
+    ) -> None:
+        if not self.policy.should_store_episode(user_text):
+            return
 
-        return None
+        topic_text = (topic or "").strip() or "本轮对话"
+        content = f"主题:{topic_text} | USER:{user_text[:120]} | ASSISTANT:{assistant_reply[:120]}"
+        rec = MemoryRecord(
+            memory_id=None,
+            user_id=user_id,
+            session_id=session_id,
+            memory_type=MemoryType.EPISODIC,
+            content=content,
+            tags="episodic,topic,turn",
+            ttl_seconds=self.policy.default_ttl_seconds(MemoryType.EPISODIC),
+            source="turn_summary",
+            payload={"meta": meta, "topic": topic_text},
+        )
+        self._add_if_not_duplicate(rec)
 
     def cleanup_expired(self, user_id: Optional[str] = None) -> int:
         _ = user_id  # kept for backward-compatible call signature
@@ -334,6 +361,10 @@ class MemoryService:
         return out
 
     def close(self) -> None:
+        try:
+            self.turn_summarizer.close()
+        except Exception as exc:
+            logger.warning(f"Turn summarizer close failed: {exc}")
         try:
             self.vector_indexer.close()
         except Exception as exc:

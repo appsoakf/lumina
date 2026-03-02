@@ -1,9 +1,8 @@
 import logging
 from typing import Optional
 
-from openai import OpenAI
-
 from core.config import load_app_config
+from core.llm.chat_service import ChatCompletionService
 from core.utils.errors import AppError, ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -12,14 +11,11 @@ logger = logging.getLogger(__name__)
 class TranslateEngine:
     def __init__(self):
         cfg = load_app_config().llm
-        if not cfg.translate_api_key:
-            raise AppError(
-                ErrorCode.CONFIG_MISSING,
-                "Missing translate API key. Set LUMINA_API_KEY or translate_api_key in config.",
-                details={"field": "translate_api_key"},
-            )
-        self.client = OpenAI(api_key=cfg.translate_api_key, base_url=cfg.translate_api_url)
-        self.model = cfg.translate_model
+        self.chat_llm = ChatCompletionService.from_translate_config(
+            default_temperature=0.0,
+            missing_key_message="Missing translate API key. Set LUMINA_API_KEY or translate_api_key in config.",
+            missing_key_field="translate_api_key",
+        )
         self.translate_prompt = cfg.translate_prompt
         self.last_error: Optional[AppError] = None
 
@@ -30,10 +26,9 @@ class TranslateEngine:
                 {"role": "system", "content": self.translate_prompt + "/no_think"},
                 {"role": "user", "content": text},
             ]
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion = self.chat_llm.invoke(
                 messages=messages,
-                stream=False,
+                temperature=0.0,
             )
             result = (completion.choices[0].message.content or "").strip()
             if not result:

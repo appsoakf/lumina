@@ -5,6 +5,7 @@ from .models import MemoryRecord, MemoryType
 from .short_term_store import ShortTermMemoryStore
 from .service import MemoryService
 from .store import LongTermMemoryStore
+from .turn_summarizer import AsyncTurnSummarizer, TurnSummary, TurnSummaryExtractor
 from .vector_store import QdrantVectorStore
 
 __all__ = [
@@ -18,4 +19,7 @@ __all__ = [
     "QdrantVectorStore",
     "MemoryVectorIndexer",
     "HybridMemoryRetriever",
+    "TurnSummary",
+    "TurnSummaryExtractor",
+    "AsyncTurnSummarizer",
 ]

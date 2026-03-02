@@ -16,6 +16,7 @@ Lumina Memory 系统面向本地部署个人助手，核心目标：
 - `models.py`：`MemoryType`、`MemoryRecord`（含 `content_hash`）。
 - `policy.py`：写入策略、TTL、去重窗口、清理周期。
 - `ingestor.py`：从用户文本提取 profile/commitment 候选。
+- `turn_summarizer.py`：每轮对话异步提取主题与偏好候选。
 - `store.py`：SQLite 持久化、过期过滤/清理、去重检测、按 ID 回表。
 - `retriever.py`：关键词检索（含类型权重与时间衰减排序）。
 - `embedding.py`：Embedding Provider（OpenAI API）。
@@ -47,9 +48,9 @@ Qdrant 点位（可选）：
 ### 4.1 写入链路
 
 1. Orchestrator 调用 `MemoryService.ingest_turn(...)`。
-2. `policy + ingestor` 生成候选记忆。
-3. `service` 计算 `content_hash`，按窗口去重。
-4. 非重复项写入 SQLite。
+2. `service` 同步写入 commitment/procedural（按策略）。
+3. `turn_summarizer` 异步提取本轮 topic/profile 候选。
+4. `service` 计算 `content_hash`，按窗口去重后写入 SQLite（异步失败会同步兜底）。
 5. 若开启向量检索：提交异步索引队列，后台 embedding 后 upsert Qdrant。
 6. 周期触发过期清理，清理 SQLite 后同步删除 Qdrant 点位。
 
@@ -60,14 +61,11 @@ Qdrant 点位（可选）：
 3. `memory_vector.enabled=true`：走混合检索（关键词 + 向量），失败自动回退关键词。
 4. 返回 TopK 后按“用户偏好/未完成事项/相关历史”拼接上下文。
 
-### 4.3 指令链路
+### 4.3 交互方式
 
-支持指令：
-
-- `记住 ...`
-- `我的偏好` / `查看记忆`
-- `我的待办` / `查看待办`
-- `完成待办 #ID`
+- 默认无显式记忆指令，采用“自由对话 + 自动提取”。
+- 每轮对话后异步抽取 topic/profile，commitment/procedural 继续按策略写入。
+- 记忆读取由 `build_context(query)` 在后续轮次自动注入，无需手工触发。
 
 ## 5. 结构图
 
@@ -80,6 +78,7 @@ Orchestrator
     +--> MemoryService
           |
           +--> MemoryPolicy + MemoryIngestor
+          +--> AsyncTurnSummarizer(topic/profile)
           +--> LongTermMemoryStore (SQLite)
           |      |- add / search / list_recent
           |      |- dedupe / ttl filter / purge_expired_ids

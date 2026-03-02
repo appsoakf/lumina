@@ -227,7 +227,6 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
                 "tool_events": len(tool_events),
                 "route_intent": orchestrated.intent.value,
                 "task_id": orchestrated.meta.get("task_id"),
-                "phase": orchestrated.meta.get("phase"),
             },
         )
 

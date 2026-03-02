@@ -1,0 +1,11 @@
+{
+  "task_id": "t-20260302134936-17f32875",
+  "session_id": "s1",
+  "user_text": "second",
+  "state": "cancelled",
+  "plan": null,
+  "step_results": [],
+  "error": null,
+  "created_at": "2026-03-02T13:49:36.577059+00:00",
+  "updated_at": "2026-03-02T13:49:36.577059+00:00"
+}

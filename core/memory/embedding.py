@@ -1,9 +1,8 @@
 import logging
-from typing import List, Optional
-
-from openai import OpenAI
+from typing import Any, List, Optional
 
 from core.config import MemoryVectorConfig
+from core.llm.client import create_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +19,13 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def __init__(self, cfg: MemoryVectorConfig):
         self.cfg = cfg
         self._ready = bool(cfg.enabled)
-        self.client: Optional[OpenAI] = None
+        self.client: Optional[Any] = None
 
         if not self._ready:
             return
 
         try:
-            self.client = OpenAI(api_key=cfg.embedding_api_key, base_url=cfg.embedding_api_url)
+            self.client = create_openai_client(api_key=cfg.embedding_api_key, base_url=cfg.embedding_api_url)
         except Exception as exc:
             logger.warning(f"Embedding provider init failed, fallback to keyword-only retrieval: {exc}")
             self._ready = False
