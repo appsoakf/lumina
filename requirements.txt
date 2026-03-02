@@ -1,0 +1,5 @@
+flask
+flask-sock
+openai
+requests
+pydantic
