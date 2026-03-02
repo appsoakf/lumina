@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from core.memory.models import MemoryRecord, MemoryType, utc_now
 
 
-class MemoryStore:
+class LongTermMemoryStore:
     """SQLite-backed memory store for local-first memory management."""
 
     def __init__(self, db_path: str = "D:/lumina/runtime/memory/memory.db"):

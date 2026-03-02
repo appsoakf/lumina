@@ -4,8 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from core.error_codes import ErrorCode
-from core.errors import LuminaError
+from core.utils.errors import AppError, ErrorCode
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -66,7 +65,7 @@ class AppConfig:
 
 def _load_json(path: Path) -> dict:
     if not path.exists():
-        raise LuminaError(
+        raise AppError(
             ErrorCode.CONFIG_MISSING,
             "Config file not found",
             details={"path": str(path)},
@@ -83,7 +82,7 @@ def _to_int(value, path: str) -> int:
     try:
         return int(value)
     except Exception:
-        raise LuminaError(
+        raise AppError(
             ErrorCode.CONFIG_INVALID,
             "Invalid integer config value",
             details={"field": path, "value": value},
@@ -101,7 +100,7 @@ def _to_bool(value, path: str) -> bool:
             return True
         if lowered in {"0", "false", "no", "off"}:
             return False
-    raise LuminaError(
+    raise AppError(
         ErrorCode.CONFIG_INVALID,
         "Invalid boolean config value",
         details={"field": path, "value": value},
@@ -130,7 +129,7 @@ def _build_llm_config(raw: dict) -> LLMConfig:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        raise LuminaError(
+        raise AppError(
             ErrorCode.CONFIG_MISSING,
             "Missing required LLM config fields",
             details={"fields": missing},
@@ -152,7 +151,7 @@ def _build_tts_config(raw: dict) -> TTSConfig:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        raise LuminaError(
+        raise AppError(
             ErrorCode.CONFIG_MISSING,
             "Missing required TTS config fields",
             details={"fields": missing},
@@ -175,7 +174,7 @@ def _build_service_config(raw: dict) -> ServiceConfig:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        raise LuminaError(
+        raise AppError(
             ErrorCode.CONFIG_MISSING,
             "Missing required service config fields",
             details={"fields": missing},
@@ -241,7 +240,7 @@ def _build_memory_vector_config(service_raw: dict, llm_raw: dict) -> MemoryVecto
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
-            raise LuminaError(
+            raise AppError(
                 ErrorCode.CONFIG_MISSING,
                 "Missing required memory vector config fields",
                 details={"fields": missing},

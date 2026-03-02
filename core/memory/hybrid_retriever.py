@@ -5,7 +5,7 @@ from core.config import MemoryVectorConfig
 from core.memory.embedding import EmbeddingProvider
 from core.memory.models import MemoryType
 from core.memory.retriever import MemoryRetriever
-from core.memory.store import MemoryStore
+from core.memory.store import LongTermMemoryStore
 from core.memory.vector_store import QdrantVectorStore
 
 
@@ -23,7 +23,7 @@ class HybridMemoryRetriever:
     def __init__(
         self,
         keyword_retriever: MemoryRetriever,
-        store: MemoryStore,
+        store: LongTermMemoryStore,
         embedder: EmbeddingProvider,
         vector_store: QdrantVectorStore,
         cfg: MemoryVectorConfig,

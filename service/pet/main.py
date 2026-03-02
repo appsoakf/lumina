@@ -12,11 +12,10 @@ from flask_sock import Sock
 
 from core.config import load_app_config
 from core.emotion.main import EmotionEngine
-from core.error_codes import ErrorCode
-from core.errors import error_payload
-from core.integration import CircuitBreaker, SessionStore, TraceLogger
+from core.utils import TraceLogger
+from core.utils.errors import ErrorCode, error_payload
 from core.llm.main import TranslateEngine
-from core.orchestrator import LuminaOrchestrator
+from core.orchestrator import Orchestrator
 from core.tts.main import TTSEngine, TTSRequest
 from service.pet.pipeline import AudioChunk, EmotionContext, OrderedSentenceMap, SentenceSlot
 
@@ -36,14 +35,10 @@ server_ip = app_config.service.server_address
 server_port = app_config.service.server_port
 
 # --- engines ---
-orchestrator = LuminaOrchestrator()
+orchestrator = Orchestrator()
 translator = TranslateEngine()
 tts = TTSEngine()
 emotion_engine = EmotionEngine()
-
-# --- integrated services ---
-session_store = SessionStore()
-service_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=120)
 
 # --- Flask app ---
 app = Flask(__name__)
@@ -73,22 +68,17 @@ def ws_send_error(ws, code: ErrorCode, message: str, retryable: bool = False, de
 
 
 def sentence_worker(slot: SentenceSlot, emotion_ctx: EmotionContext, trace: TraceLogger):
-    """Translate + wait emotion + TTS stream into sentence queue with circuit-breaker guard."""
+    """Translate + wait emotion + TTS stream into sentence queue."""
     try:
         start = time.time()
 
         # 1) translate
-        if service_breaker.is_open("translate"):
+        ja_text = translator.translate(slot.chinese_text)
+        ok = bool(ja_text)
+        if translator.last_error is not None:
+            trace.log("translate_error", translator.last_error.to_payload())
+        if not ok:
             ja_text = slot.chinese_text
-            logger.warning("translate breaker open, using source text directly")
-        else:
-            ja_text = translator.translate(slot.chinese_text)
-            ok = bool(ja_text)
-            service_breaker.record("translate", ok)
-            if translator.last_error is not None:
-                trace.log("translate_error", translator.last_error.to_payload())
-            if not ok:
-                ja_text = slot.chinese_text
 
         slot.japanese_text = ja_text
         logger.info(f"Slot {slot.index} translated in {time.time() - start:.2f}s")
@@ -97,12 +87,6 @@ def sentence_worker(slot: SentenceSlot, emotion_ctx: EmotionContext, trace: Trac
         emotion_ctx.event.wait(timeout=3)
 
         # 3) TTS streaming
-        if service_breaker.is_open("tts"):
-            logger.warning("tts breaker open, skip audio generation for this sentence")
-            slot.chunk_queue.put(None)
-            slot.done.set()
-            return
-
         tts_req = TTSRequest(
             text=ja_text,
             ref_audio_path=emotion_ctx.ref_audio_path,
@@ -110,7 +94,6 @@ def sentence_worker(slot: SentenceSlot, emotion_ctx: EmotionContext, trace: Trac
             media_type="raw",
         )
         result = tts.synthesize_streaming(tts_req)
-        service_breaker.record("tts", result.get("success", False))
 
         if result.get("success"):
             for chunk in result["audio_stream"]:
@@ -131,7 +114,6 @@ def sentence_worker(slot: SentenceSlot, emotion_ctx: EmotionContext, trace: Trac
         slot.done.set()
     except Exception as exc:
         logger.error(f"Worker error slot {slot.index}: {exc}")
-        service_breaker.record("tts", False)
         slot.error = str(exc)
         trace.log(
             "worker_error",
@@ -157,7 +139,7 @@ def consume_and_send(ws, ordered_map: OrderedSentenceMap):
     ws_send(ws, {"type": "audio_done"})
 
 
-def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, trace: TraceLogger, round_num: int):
+def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, round_num: int):
     started = time.time()
 
     trace.log("round_start", {"round": round_num, "user_text": user_text})
@@ -168,12 +150,8 @@ def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, t
 
     tool_events = []
     try:
-        # Keep conversation history explicit (user -> assistant)
-        history.append({"role": "user", "content": user_text})
-
         orchestrated = orchestrator.handle_user_message(
             user_text=user_text,
-            history=history[:-1],
             session_id=session_id,
             user_id=username,
         )
@@ -193,8 +171,6 @@ def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, t
                 trace.log("tool_event", event)
             if orchestrated.executor_result.error:
                 trace.log("executor_error", orchestrated.executor_result.error)
-
-        history.append({"role": "assistant", "content": full_reply})
 
         # parse emotion header and text
         emotion, text, intensity = emotion_engine.parse_leading_json(full_reply)
@@ -241,9 +217,10 @@ def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, t
 
         consume_and_send(ws, ordered_map)
 
-        session_store.save_round(
+        orchestrator.record_session_round(
             session_id=session_id,
-            history=history,
+            user_text=user_text,
+            assistant_reply=full_reply,
             metadata={
                 "round": round_num,
                 "duration_ms": int((time.time() - started) * 1000),
@@ -280,7 +257,6 @@ def handle_bot_reply(ws, user_text: str, history: list[dict], session_id: str, t
 @sock.route('/ws')
 def websocket_handler(ws):
     logger.info("WebSocket connected")
-    history = []
     session_id = f"ws-{uuid.uuid4().hex[:10]}"
     trace = TraceLogger(session_id=session_id)
     trace.log("session_start", {"session_id": session_id})
@@ -297,7 +273,7 @@ def websocket_handler(ws):
             if not user_text:
                 continue
             round_count += 1
-            handle_bot_reply(ws, user_text, history, session_id, trace, round_count)
+            handle_bot_reply(ws, user_text, session_id, trace, round_count)
     except Exception as exc:
         disconnect_reason = str(exc)
         logger.info(f"WebSocket disconnected: {exc}")

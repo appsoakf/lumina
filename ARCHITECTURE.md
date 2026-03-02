@@ -6,6 +6,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 任务生命周期管理（create/query/cancel/retry）
 - 通用任务链路（planner/executor/critic）
 - 本地记忆系统（Memory OS Lite，含可选向量检索）
+- Agent 公共能力复用（`BaseLLMAgent` + `JSONParseMixin`）
 - 现有情感驱动 TTS 流式链路保持不变
 
 入口：`main.py -> service.pet.main.run_pet()`。
@@ -16,7 +17,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - `policy.py`: 记忆写入策略、TTL、去重窗口、清理周期
 - `ingestor.py`: 从用户语句抽取偏好与待办候选
 - `retriever.py`: 关键词检索（类型权重 + 时间衰减）
-- `service.py`: 统一网关 `MemoryService`
+- `service.py`: 统一网关 `MemoryService`（长期语义记忆 + 短期会话历史）
 
 向量检索组件（可选）：
 - `embedding.py`: Embedding provider（OpenAI API）
@@ -32,7 +33,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - `artifact`（预留）
 
 ## 3. Orchestrator
-`core/orchestrator/lumina_orchestrator.py` 新能力：
+`core/orchestrator/orchestrator.py` 新能力：
 1. 每轮请求前：注入记忆上下文到 agent history（个性化与连续性）
 2. 每轮请求后：自动沉淀记忆（偏好、待办、会话摘要、流程经验）
 3. 增加记忆指令：
@@ -44,16 +45,20 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
    - `查询任务 <task_id>`
    - `取消任务 <task_id>`
    - `重试任务 <task_id>`
+5. 对外统一公共接口：
+   - `handle_user_message(user_text, session_id, user_id)`
+   - `record_session_round(session_id, user_text, assistant_reply, metadata)`
+   （`service` 层不直接访问 orchestrator 内部依赖）
 
 ## 4. 端到端流程（当前）
 1. WS 收到用户消息
-2. orchestrator 先处理任务指令 / 记忆指令
-3. 非指令请求：注入记忆上下文后做 chat/task 路由
-4. task 模式执行多 agent 链路 + task manager 状态跟踪
-5. 结果写回 memory + session + trace
-6. 若启用向量检索：memory 写入后异步 embedding + upsert Qdrant
-7. 记忆过期清理时同步删除 Qdrant 点位
-8. 输出走 emotion/translate/tts/audio streaming
+2. `service` 调用 `orchestrator.handle_user_message(...)`（不显式传递 history）
+3. orchestrator 通过 `MemoryService.get_recent_history` + `build_context` 组装上下文
+4. orchestrator 处理任务指令 / 记忆指令；非指令请求执行 chat/task 路由
+5. task 模式执行多 agent 链路 + task manager 状态跟踪
+6. orchestrator 在回合内沉淀长期记忆；若启用向量检索则异步 upsert Qdrant
+7. `service` 调用 `orchestrator.record_session_round(...)` 落盘短期会话历史
+8. 输出走 emotion/translate/tts/audio streaming + trace
 
 ## 5. 持久化目录
 - `runtime/memory/` 记忆库
@@ -65,7 +70,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 ## 6. 协议与状态
 - `TaskState`: `pending/running/succeeded/failed/cancelled`
 - `OrchestrationResult`: 兼容原接口，新增 `phase=phase6` 等 meta
-- 错误码体系仍沿用 `core/error_codes.py`
+- 错误码体系统一由 `core/utils/errors.py` 管理
 
 ## 7. 向量检索配置（可选）
 配置位于 `service/pet/config.json` 的 `memory_vector` 节点，关键项：
@@ -93,13 +98,14 @@ Client
   -> WS(/ws)
   -> service.pet.main.websocket_handler
   -> handle_bot_reply
-  -> LuminaOrchestrator.handle_user_message
+  -> Orchestrator.handle_user_message
+      -> MemoryService.get_recent_history (session short-term)
       -> MemoryService.build_context
           -> (keyword) MemoryRetriever
           -> (optional) HybridMemoryRetriever
               -> EmbeddingProvider.embed(query)
               -> QdrantVectorStore.search
-              -> MemoryStore.get_by_ids
+              -> LongTermMemoryStore.get_by_ids
       -> ChatAgent.classify_intent => TASK
       -> PlannerAgent 生成计划
       -> ExecutorAgent 执行步骤与工具调用
@@ -107,10 +113,13 @@ Client
       -> ChatAgent.reply_with_task_result 生成最终文本
       -> MemoryService.ingest_turn
           -> MemoryPolicy + MemoryIngestor
-          -> MemoryStore.add (SQLite)
+          -> LongTermMemoryStore.add (SQLite)
           -> MemoryVectorIndexer.enqueue (async)
               -> EmbeddingProvider.embed(content)
               -> QdrantVectorStore.upsert
+  -> Orchestrator.record_session_round
+      -> MemoryService.record_session_round
+          -> ShortTermMemoryStore.save_round
   -> EmotionEngine + TranslateEngine + TTSEngine
   -> WS audio/text streaming response
 ```
@@ -119,10 +128,12 @@ Client
 
 | 模块 | 输入 | 处理 | 输出 |
 |---|---|---|---|
-| `websocket_handler` / `handle_bot_reply` | WS JSON：`{"content": "..."} ` | 解析文本、维护会话 `history/session_id`、调用 orchestrator | `orchestrated.final_reply` + 流式音频输出 |
-| `LuminaOrchestrator.handle_user_message` | `user_text`, `history`, `session_id`, `user_id` | 指令判断（任务/记忆命令），记忆上下文注入，chat/task 路由，多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
+| `websocket_handler` / `handle_bot_reply` | WS JSON：`{"content": "..."} ` | 解析文本、调用 orchestrator 公共接口，不显式维护 history 列表 | `orchestrated.final_reply` + 流式音频输出 |
+| `Orchestrator.handle_user_message` | `user_text`, `session_id`, `user_id` | 指令判断（任务/记忆命令），从 memory 读取短期 history，注入长期上下文并执行多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
 | `MemoryService.build_context` | `query` | 拉取 profile/commitment/relevant；启用向量时做 hybrid 检索并回退兜底 | 可注入 history 的 memory context 文本 |
+| `MemoryService.get_recent_history` / `record_session_round` | `session_id`, 回合消息 | 读取/写入短期会话历史（`ShortTermMemoryStore` 持久化） | recent history / session snapshot |
 | `HybridMemoryRetriever.search`（可选） | `query`, `limit`, `memory_types` | 关键词召回 + 向量召回，按综合分重排（vector/keyword/recency/type） | 相关记忆列表（TopK） |
+| `BaseLLMAgent` / `JSONParseMixin` | agent 消息与模型原始输出 | 统一 LLM client 调用、温度参数、JSON 清洗解析 | 降低各 agent 重复实现和解析偏差 |
 | `PlannerAgent` | 任务请求 + 历史上下文 | 拆解执行步骤，生成 plan | `PlanResult(goal, steps)` |
 | `ExecutorAgent` | 单步任务输入 + 工具上下文 | 多轮 function calling，执行工具并汇总 step result | `ExecutorRunResult(output_text, tool_events, error)` |
 | `CriticAgent` | `user_text`, `plan`, `execution_graph` | 质量评审，给出 `pass/revise` 与建议 | `CriticResult` |

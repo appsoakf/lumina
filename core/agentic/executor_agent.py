@@ -2,31 +2,23 @@ import json
 import logging
 from typing import Dict, List
 
-from openai import OpenAI
-
 from core.agentic.tools import ToolContext, build_default_registry
-from core.config import load_app_config
-from core.error_codes import ErrorCode
-from core.errors import LuminaError, error_payload
+from core.agentic.base import BaseLLMAgent
+from core.utils.errors import ErrorCode, error_payload
 from core.protocols import ExecutorRunResult
 
 logger = logging.getLogger(__name__)
 
 
-class ExecutorAgent:
+class ExecutorAgent(BaseLLMAgent):
     """Task executor agent: function-calling + tool execution."""
 
     def __init__(self, max_tool_rounds: int = 4):
-        llm_cfg = load_app_config().llm
-        if not llm_cfg.chat_api_key:
-            raise LuminaError(
-                ErrorCode.CONFIG_MISSING,
-                "Missing LLM API key for executor agent",
-                details={"field": "chat_api_key"},
-            )
-
-        self.client = OpenAI(api_key=llm_cfg.chat_api_key, base_url=llm_cfg.chat_api_url)
-        self.model = llm_cfg.chat_model
+        super().__init__(
+            missing_key_message="Missing LLM API key for executor agent",
+            missing_key_field="chat_api_key",
+            default_temperature=0.2,
+        )
         self.max_tool_rounds = max_tool_rounds
         self.registry = build_default_registry()
 
@@ -53,12 +45,10 @@ class ExecutorAgent:
 
         try:
             for _ in range(self.max_tool_rounds):
-                resp = self.client.chat.completions.create(
-                    model=self.model,
+                resp = self.invoke_chat(
                     messages=messages,
                     tools=self.registry.list_schemas(),
                     tool_choice="auto",
-                    stream=False,
                     temperature=0.2,
                 )
                 msg = resp.choices[0].message

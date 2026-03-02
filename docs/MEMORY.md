@@ -75,12 +75,12 @@ Qdrant 点位（可选）：
 User Message
     |
     v
-LuminaOrchestrator
+Orchestrator
     |
     +--> MemoryService
           |
           +--> MemoryPolicy + MemoryIngestor
-          +--> MemoryStore (SQLite)
+          +--> LongTermMemoryStore (SQLite)
           |      |- add / search / list_recent
           |      |- dedupe / ttl filter / purge_expired_ids
           |

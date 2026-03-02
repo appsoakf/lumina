@@ -15,7 +15,7 @@ from core.tasks import TaskManager
 logger = logging.getLogger(__name__)
 
 
-class LuminaOrchestrator:
+class Orchestrator:
     """Phase 6 orchestrator: dynamic routing + task lifecycle + memory system."""
 
     TASK_ID_RE = re.compile(r"(t-[0-9]{14}-[a-f0-9]{8})", re.IGNORECASE)
@@ -37,8 +37,8 @@ class LuminaOrchestrator:
             "critic_agent": critic_agent or CriticAgent(),
         }
         self.capabilities = capability_registry or build_default_registry()
-        self.task_manager = task_manager or TaskManager()
-        self.memory = memory_service or MemoryService()
+        self._task_manager = task_manager or TaskManager()
+        self._memory = memory_service or MemoryService()
 
     def _resolve_agent(self, capability: str):
         agent_name = self.capabilities.resolve_agent(capability)
@@ -48,7 +48,7 @@ class LuminaOrchestrator:
         return agent_name, agent
 
     def _augment_history_with_memory(self, history: List[Dict[str, str]], user_id: str, query: str) -> List[Dict[str, str]]:
-        context = self.memory.build_context(user_id=user_id, query=query)
+        context = self._memory.build_context(user_id=user_id, query=query)
         if not context:
             return list(history)
         mem_msg = {
@@ -62,7 +62,7 @@ class LuminaOrchestrator:
 
     def _record_memory(self, session_id: str, user_id: str, user_text: str, final_reply: str, meta: Dict) -> None:
         try:
-            self.memory.ingest_turn(
+            self._memory.ingest_turn(
                 session_id=session_id,
                 user_id=user_id,
                 user_text=user_text,
@@ -71,6 +71,20 @@ class LuminaOrchestrator:
             )
         except Exception as exc:
             logger.warning(f"Memory ingest skipped due to error: {exc}")
+
+    def record_session_round(
+        self,
+        session_id: str,
+        user_text: str,
+        assistant_reply: str,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self._memory.record_session_round(
+            session_id=session_id,
+            user_text=user_text,
+            assistant_reply=assistant_reply,
+            metadata=metadata,
+        )
 
     def _build_step_task_input(self, user_text: str, graph: TaskGraph, step_id: str) -> str:
         node = next(n for n in graph.nodes if n.step_id == step_id)
@@ -99,7 +113,7 @@ class LuminaOrchestrator:
         step_results = []
 
         for node in graph.pending_nodes():
-            task = self.task_manager.get_task(task_id)
+            task = self._task_manager.get_task(task_id)
             if task and task.state == TaskState.CANCELLED:
                 cancel_error = {"code": "TASK_CANCELLED", "message": "Task cancelled by user", "retryable": True}
                 first_error = first_error or cancel_error
@@ -123,7 +137,7 @@ class LuminaOrchestrator:
                 "error": run_result.error,
             }
             step_results.append(step_result)
-            self.task_manager.append_step_result(task_id, step_result)
+            self._task_manager.append_step_result(task_id, step_result)
 
             if run_result.error:
                 graph.mark_failed(
@@ -186,7 +200,7 @@ class LuminaOrchestrator:
     def _format_task_status(self, task_id: str) -> str:
         if not task_id:
             return "未识别到任务ID，请提供形如 t-YYYYMMDDHHMMSS-xxxxxxxx 的任务号。"
-        task = self.task_manager.get_task(task_id)
+        task = self._task_manager.get_task(task_id)
         if not task:
             return f"未找到任务 {task_id}。"
 
@@ -214,10 +228,10 @@ class LuminaOrchestrator:
         if action == "query":
             status_text = self._format_task_status(task_id)
         elif action == "cancel":
-            ok = self.task_manager.cancel_task(task_id) if task_id else False
+            ok = self._task_manager.cancel_task(task_id) if task_id else False
             status_text = f"任务 {task_id} 已取消。" if ok else f"取消失败，任务 {task_id or '(缺失ID)'} 不可取消或不存在。"
         elif action == "retry":
-            task = self.task_manager.retry_task(task_id) if task_id else None
+            task = self._task_manager.retry_task(task_id) if task_id else None
             status_text = (
                 f"任务 {task_id} 已重置为 pending，可再次执行。" if task else f"重试失败，任务 {task_id or '(缺失ID)'} 不存在。"
             )
@@ -250,7 +264,7 @@ class LuminaOrchestrator:
         session_id: str,
         user_id: str,
     ) -> Optional[OrchestrationResult]:
-        cmd = self.memory.parse_memory_command(user_text)
+        cmd = self._memory.parse_memory_command(user_text)
         if not cmd:
             return None
 
@@ -262,10 +276,10 @@ class LuminaOrchestrator:
             if not value:
                 result_text = "请在“记住”后提供要保存的信息。"
             else:
-                memory_id = self.memory.remember(user_id=user_id, session_id=session_id, content=value)
+                memory_id = self._memory.remember(user_id=user_id, session_id=session_id, content=value)
                 result_text = f"已记住（#{memory_id}）：{value}"
         elif action == "list_profile":
-            rows = self.memory.list_profile(user_id=user_id, limit=8)
+            rows = self._memory.list_profile(user_id=user_id, limit=8)
             if not rows:
                 result_text = "当前还没有已记录的偏好记忆。"
             else:
@@ -274,7 +288,7 @@ class LuminaOrchestrator:
                     lines.append(f"- #{r.get('memory_id')} {r.get('content')}")
                 result_text = "\n".join(lines)
         elif action == "list_commitments":
-            rows = self.memory.list_commitments(user_id=user_id, limit=8)
+            rows = self._memory.list_commitments(user_id=user_id, limit=8)
             if not rows:
                 result_text = "当前没有未完成待办。"
             else:
@@ -286,7 +300,7 @@ class LuminaOrchestrator:
                 result_text = "\n".join(lines)
         elif action == "close_commitment":
             memory_id = int(cmd.get("memory_id"))
-            ok = self.memory.close_commitment(user_id=user_id, memory_id=memory_id)
+            ok = self._memory.close_commitment(user_id=user_id, memory_id=memory_id)
             result_text = f"待办 #{memory_id} 已标记完成。" if ok else f"未找到待办 #{memory_id}。"
         else:
             result_text = "未知记忆指令。"
@@ -312,10 +326,11 @@ class LuminaOrchestrator:
     def handle_user_message(
         self,
         user_text: str,
-        history: List[Dict[str, str]],
         session_id: str,
         user_id: str,
     ) -> OrchestrationResult:
+        history = self._memory.get_recent_history(session_id=session_id)
+
         # task lifecycle commands
         command_result = self._handle_task_command(user_text=user_text, history=history)
         if command_result is not None:
@@ -350,16 +365,16 @@ class LuminaOrchestrator:
             )
 
         # task mode (phase6)
-        task = self.task_manager.create_task(session_id=session_id, user_text=user_text)
+        task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
         task_id = task.task_id
-        self.task_manager.set_state(task_id, TaskState.RUNNING)
+        self._task_manager.set_state(task_id, TaskState.RUNNING)
 
         _, planner_agent = self._resolve_agent("task_planning")
         _, critic_agent = self._resolve_agent("task_review")
 
         plan_result = planner_agent.plan_task(user_text=user_text, history=enriched_history)
 
-        self.task_manager.set_plan(task_id, plan_result.to_dict())
+        self._task_manager.set_plan(task_id, plan_result.to_dict())
 
         graph = TaskGraph.from_plan(plan_result)
         run_info = self._run_plan_steps(
@@ -386,12 +401,12 @@ class LuminaOrchestrator:
             step_results=run_info["step_results"],
         )
 
-        current_task = self.task_manager.get_task(task_id)
+        current_task = self._task_manager.get_task(task_id)
         if not current_task or current_task.state != TaskState.CANCELLED:
             if run_info["first_error"]:
-                self.task_manager.set_state(task_id, TaskState.FAILED, error=run_info["first_error"])
+                self._task_manager.set_state(task_id, TaskState.FAILED, error=run_info["first_error"])
             else:
-                self.task_manager.set_state(task_id, TaskState.SUCCEEDED)
+                self._task_manager.set_state(task_id, TaskState.SUCCEEDED)
 
         final_reply = chat_agent.reply_with_task_result(
             user_text=user_text,

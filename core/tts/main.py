@@ -6,7 +6,7 @@ import requests as sync_requests
 from pydantic import BaseModel
 
 from core.config import load_app_config
-from core.error_codes import ErrorCode
+from core.utils.errors import ErrorCode
 
 logger = logging.getLogger(__name__)
 

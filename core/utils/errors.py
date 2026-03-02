@@ -1,9 +1,28 @@
+from enum import Enum
 from typing import Any, Dict, Optional
 
-from core.error_codes import ErrorCode
+
+class ErrorCode(str, Enum):
+    CONFIG_MISSING = "CONFIG_MISSING"
+    CONFIG_INVALID = "CONFIG_INVALID"
+
+    LLM_API_ERROR = "LLM_API_ERROR"
+    LLM_STREAM_ERROR = "LLM_STREAM_ERROR"
+
+    TRANSLATE_API_ERROR = "TRANSLATE_API_ERROR"
+    TRANSLATE_EMPTY_RESULT = "TRANSLATE_EMPTY_RESULT"
+
+    TTS_CONNECTION_ERROR = "TTS_CONNECTION_ERROR"
+    TTS_API_ERROR = "TTS_API_ERROR"
+    TTS_STREAM_ERROR = "TTS_STREAM_ERROR"
+
+    TOOL_EXECUTION_ERROR = "TOOL_EXECUTION_ERROR"
+    PIPELINE_ERROR = "PIPELINE_ERROR"
+    WEBSOCKET_ERROR = "WEBSOCKET_ERROR"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-class LuminaError(Exception):
+class AppError(Exception):
     def __init__(
         self,
         code: ErrorCode,

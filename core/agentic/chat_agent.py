@@ -3,17 +3,14 @@ import logging
 import re
 from typing import Dict, List
 
-from openai import OpenAI
-
+from core.agentic.base import BaseLLMAgent
 from core.config import load_app_config
-from core.error_codes import ErrorCode
-from core.errors import LuminaError
 from core.protocols import RoutingIntent
 
 logger = logging.getLogger(__name__)
 
 
-class ChatAgent:
+class ChatAgent(BaseLLMAgent):
     """Resident chat agent: user communication + final response composition."""
 
     TASK_KEYWORDS = {
@@ -22,25 +19,16 @@ class ChatAgent:
     }
 
     def __init__(self):
+        super().__init__(
+            missing_key_message="Missing LLM API key for chat agent",
+            missing_key_field="chat_api_key",
+            default_temperature=0.5,
+        )
         llm_cfg = load_app_config().llm
-        if not llm_cfg.chat_api_key:
-            raise LuminaError(
-                ErrorCode.CONFIG_MISSING,
-                "Missing LLM API key for chat agent",
-                details={"field": "chat_api_key"},
-            )
-
-        self.client = OpenAI(api_key=llm_cfg.chat_api_key, base_url=llm_cfg.chat_api_url)
-        self.model = llm_cfg.chat_model
         self.chat_prompt = llm_cfg.chat_prompt
 
     def _invoke(self, messages: List[Dict[str, str]], temperature: float = 0.5) -> str:
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            temperature=temperature,
-        )
+        completion = self.invoke_chat(messages, temperature=temperature)
         return (completion.choices[0].message.content or "").strip()
 
     def _ensure_emotion_format(self, text: str) -> str:

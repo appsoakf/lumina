@@ -12,7 +12,8 @@ from core.memory.ingestor import MemoryIngestor
 from core.memory.models import MemoryRecord, MemoryType
 from core.memory.policy import MemoryPolicy
 from core.memory.retriever import MemoryRetriever
-from core.memory.store import MemoryStore
+from core.memory.short_term_store import ShortTermMemoryStore
+from core.memory.store import LongTermMemoryStore
 from core.memory.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
@@ -23,15 +24,19 @@ class MemoryService:
 
     def __init__(
         self,
-        store: Optional[MemoryStore] = None,
+        long_term_store: Optional[LongTermMemoryStore] = None,
         policy: Optional[MemoryPolicy] = None,
         ingestor: Optional[MemoryIngestor] = None,
+        short_term_store: Optional[ShortTermMemoryStore] = None,
+        short_history_limit: int = 24,
         default_user_id: str = "default",
     ):
-        self.store = store or MemoryStore()
+        self.long_term_store = long_term_store or LongTermMemoryStore()
         self.policy = policy or MemoryPolicy()
         self.ingestor = ingestor or MemoryIngestor()
-        self.retriever = MemoryRetriever(self.store)
+        self.retriever = MemoryRetriever(self.long_term_store)
+        self.short_term_store = short_term_store or ShortTermMemoryStore()
+        self.short_history_limit = max(int(short_history_limit), 0)
         self.default_user_id = default_user_id
         self._last_cleanup_ts = 0.0
 
@@ -40,7 +45,7 @@ class MemoryService:
         self.vector_store = QdrantVectorStore(self.vector_cfg)
         self.hybrid_retriever = HybridMemoryRetriever(
             keyword_retriever=self.retriever,
-            store=self.store,
+            store=self.long_term_store,
             embedder=self.embedder,
             vector_store=self.vector_store,
             cfg=self.vector_cfg,
@@ -52,6 +57,35 @@ class MemoryService:
             queue_size=self.vector_cfg.queue_size,
             max_retries=self.vector_cfg.max_retries,
         )
+
+    def get_recent_history(self, session_id: str, limit_messages: Optional[int] = None) -> List[Dict[str, str]]:
+        limit = self.short_history_limit if limit_messages is None else limit_messages
+        rows = self.short_term_store.load_history(session_id=session_id, limit_messages=limit)
+        history: List[Dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "")).strip()
+            content = str(row.get("content", ""))
+            if not role:
+                continue
+            history.append({"role": role, "content": content})
+        return history
+
+    def record_session_round(
+        self,
+        session_id: str,
+        user_text: str,
+        assistant_reply: str,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, str]]:
+        history = self.short_term_store.load_history(session_id=session_id, limit_messages=None)
+        if user_text.strip():
+            history.append({"role": "user", "content": user_text})
+        if assistant_reply.strip():
+            history.append({"role": "assistant", "content": assistant_reply})
+        self.short_term_store.save_round(session_id=session_id, history=history, metadata=metadata or {})
+        return self.get_recent_history(session_id=session_id, limit_messages=None)
 
     def remember(self, user_id: str = "", session_id: str = "", content: str = "", tags: str = "") -> int:
         self._maybe_cleanup()
@@ -78,7 +112,7 @@ class MemoryService:
 
     def close_commitment(self, user_id: str = "", memory_id: int = 0) -> bool:
         self._maybe_cleanup()
-        rows = self.store.list_recent(memory_type=MemoryType.COMMITMENT, limit=50)
+        rows = self.long_term_store.list_recent(memory_type=MemoryType.COMMITMENT, limit=50)
         target = None
         for r in rows:
             if int(r.get("memory_id", -1)) == int(memory_id):
@@ -89,7 +123,7 @@ class MemoryService:
 
         payload = target.get("payload") or {}
         payload["status"] = "done"
-        self.store.update_payload(memory_id=memory_id, payload=payload)
+        self.long_term_store.update_payload(memory_id=memory_id, payload=payload)
         return True
 
     def build_context(self, user_id: str = "", query: str = "") -> str:
@@ -225,7 +259,7 @@ class MemoryService:
 
     def cleanup_expired(self, user_id: Optional[str] = None) -> int:
         _ = user_id  # kept for backward-compatible call signature
-        expired_ids = self.store.purge_expired_ids()
+        expired_ids = self.long_term_store.purge_expired_ids()
         self._delete_vector_points(expired_ids)
         return len(expired_ids)
 
@@ -235,7 +269,7 @@ class MemoryService:
         if now - self._last_cleanup_ts < interval:
             return
         self._last_cleanup_ts = now
-        expired_ids = self.store.purge_expired_ids()
+        expired_ids = self.long_term_store.purge_expired_ids()
         self._delete_vector_points(expired_ids)
 
     def _normalize(self, text: str) -> str:
@@ -248,7 +282,7 @@ class MemoryService:
     def _add_if_not_duplicate(self, rec: MemoryRecord) -> int:
         rec.content_hash = self._hash_content(rec.memory_type, rec.content)
         window = self.policy.dedupe_window_seconds(rec.memory_type)
-        existing_id = self.store.find_recent_duplicate_id(
+        existing_id = self.long_term_store.find_recent_duplicate_id(
             user_id=None,
             memory_type=rec.memory_type,
             content_hash=rec.content_hash,
@@ -257,7 +291,7 @@ class MemoryService:
         if existing_id is not None:
             # Idempotent write path: return existing id for stable behavior.
             return existing_id
-        memory_id = self.store.add(rec)
+        memory_id = self.long_term_store.add(rec)
         self._index_memory(memory_id, rec)
         return memory_id
 

@@ -1,4 +1,4 @@
-from .lumina_orchestrator import LuminaOrchestrator
+from .orchestrator import Orchestrator
 from .task_graph import TaskGraph, TaskNode
 
-__all__ = ["LuminaOrchestrator", "TaskGraph", "TaskNode"]
+__all__ = ["Orchestrator", "TaskGraph", "TaskNode"]

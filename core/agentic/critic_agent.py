@@ -1,46 +1,31 @@
 import json
 import logging
-import re
 from typing import Dict, List
 
-from openai import OpenAI
-
-from core.config import load_app_config
-from core.error_codes import ErrorCode
-from core.errors import LuminaError, error_payload
+from core.agentic.base import BaseLLMAgent
+from core.agentic.json_mixin import JSONParseMixin
+from core.utils.errors import ErrorCode, error_payload
 from core.protocols import CriticResult, PlanResult
 
 logger = logging.getLogger(__name__)
 
 
-class CriticAgent:
+class CriticAgent(BaseLLMAgent, JSONParseMixin):
     """Critic agent: reviews multi-step execution quality and returns corrections."""
 
     def __init__(self):
-        llm_cfg = load_app_config().llm
-        if not llm_cfg.chat_api_key:
-            raise LuminaError(
-                ErrorCode.CONFIG_MISSING,
-                "Missing LLM API key for critic agent",
-                details={"field": "chat_api_key"},
-            )
-        self.client = OpenAI(api_key=llm_cfg.chat_api_key, base_url=llm_cfg.chat_api_url)
-        self.model = llm_cfg.chat_model
+        super().__init__(
+            missing_key_message="Missing LLM API key for critic agent",
+            missing_key_field="chat_api_key",
+            default_temperature=0.1,
+        )
 
     def _invoke(self, messages: List[Dict[str, str]]) -> str:
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            temperature=0.1,
-        )
+        completion = self.invoke_chat(messages, temperature=0.1)
         return (completion.choices[0].message.content or "").strip()
 
     def _extract_json(self, text: str) -> Dict:
-        text = text.strip()
-        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"```$", "", text).strip()
-        return json.loads(text)
+        return self.parse_json_object(text, allow_brace_extract=False)
 
     def review_task(self, user_text: str, plan_result: PlanResult, execution_graph: Dict) -> CriticResult:
         system_prompt = (

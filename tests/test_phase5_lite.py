@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.capabilities.registry import build_default_registry
-from core.integration.trace_logger import TraceLogger
+from core.utils.trace_logger import TraceLogger
 from core.protocols import TaskState
 from core.tasks.manager import TaskManager
 from core.tasks.store import TaskStore

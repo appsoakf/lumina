@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Dict, List
 
 from core.memory.models import MemoryType
-from core.memory.store import MemoryStore
+from core.memory.store import LongTermMemoryStore
 
 
 class MemoryRetriever:
@@ -17,7 +17,7 @@ class MemoryRetriever:
         MemoryType.ARTIFACT.value: 1.05,
     }
 
-    def __init__(self, store: MemoryStore):
+    def __init__(self, store: LongTermMemoryStore):
         self.store = store
 
     def get_profile(self, user_id: str = "", limit: int = 5) -> List[Dict]:
