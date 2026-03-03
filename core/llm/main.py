@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from core.config import load_app_config
@@ -6,6 +7,18 @@ from core.llm.chat_service import ChatCompletionService
 from core.utils.errors import AppError, ErrorCode
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TranslateResult:
+    """Single-call translation outcome; no shared mutable error state."""
+
+    text: str
+    error: Optional[AppError] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and bool(self.text.strip())
 
 
 class TranslateEngine:
@@ -17,10 +30,11 @@ class TranslateEngine:
             missing_key_field="translate_api_key",
         )
         self.translate_prompt = cfg.translate_prompt
-        self.last_error: Optional[AppError] = None
 
     def translate(self, text: str) -> str:
-        self.last_error = None
+        return self.translate_with_status(text).text
+
+    def translate_with_status(self, text: str) -> TranslateResult:
         try:
             messages = [
                 {"role": "system", "content": self.translate_prompt + "/no_think"},
@@ -32,18 +46,19 @@ class TranslateEngine:
             )
             result = (completion.choices[0].message.content or "").strip()
             if not result:
-                self.last_error = AppError(
+                err = AppError(
                     ErrorCode.TRANSLATE_EMPTY_RESULT,
                     "Translate returned empty content",
                     retryable=True,
                 )
-                logger.warning(self.last_error.message)
-            return result
+                logger.warning(err.message)
+                return TranslateResult(text="", error=err)
+            return TranslateResult(text=result)
         except Exception as exc:
-            self.last_error = AppError(
+            err = AppError(
                 ErrorCode.TRANSLATE_API_ERROR,
                 f"Translate failed: {exc}",
                 retryable=True,
             )
-            logger.error(self.last_error.message)
-            return ""
+            logger.error(err.message)
+            return TranslateResult(text="", error=err)

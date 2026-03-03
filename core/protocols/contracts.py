@@ -21,12 +21,16 @@ class PlanItem:
     step_id: str
     title: str
     instruction: str
+    depends_on: List[str] = field(default_factory=list)
+    input_bindings: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "step_id": self.step_id,
             "title": self.title,
             "instruction": self.instruction,
+            "depends_on": list(self.depends_on),
+            "input_bindings": list(self.input_bindings),
         }
 
 
@@ -36,6 +40,7 @@ class PlanResult:
     steps: List[PlanItem] = field(default_factory=list)
     raw_text: str = ""
     error: Optional[Dict[str, Any]] = None
+    graph_policy: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,6 +48,7 @@ class PlanResult:
             "steps": [s.to_dict() for s in self.steps],
             "raw_text": self.raw_text,
             "error": self.error,
+            "graph_policy": dict(self.graph_policy),
         }
 
 

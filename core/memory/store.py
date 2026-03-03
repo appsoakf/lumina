@@ -2,16 +2,17 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from core.memory.models import MemoryRecord, MemoryType, utc_now
+from core.paths import memory_db_path
 
 
 class LongTermMemoryStore:
     """SQLite-backed memory store for local-first memory management."""
 
-    def __init__(self, db_path: str = "D:/lumina/runtime/memory/memory.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[Union[str, Path]] = None):
+        self.db_path = Path(db_path) if db_path is not None else memory_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -91,7 +92,6 @@ class LongTermMemoryStore:
 
     def list_recent(
         self,
-        user_id: Optional[str] = None,
         memory_type: Optional[MemoryType] = None,
         limit: int = 20,
     ) -> List[Dict]:
@@ -125,7 +125,6 @@ class LongTermMemoryStore:
 
     def search(
         self,
-        user_id: Optional[str] = None,
         query: str = "",
         limit: int = 8,
         memory_types: Optional[List[MemoryType]] = None,
@@ -160,13 +159,11 @@ class LongTermMemoryStore:
 
     def exists_recent_duplicate(
         self,
-        user_id: Optional[str],
         memory_type: MemoryType,
         content_hash: str,
         window_seconds: int,
     ) -> bool:
         return self.find_recent_duplicate_id(
-            user_id=user_id,
             memory_type=memory_type,
             content_hash=content_hash,
             window_seconds=window_seconds,
@@ -174,7 +171,6 @@ class LongTermMemoryStore:
 
     def find_recent_duplicate_id(
         self,
-        user_id: Optional[str],
         memory_type: MemoryType,
         content_hash: str,
         window_seconds: int,
@@ -233,10 +229,10 @@ class LongTermMemoryStore:
         finally:
             conn.close()
 
-    def purge_expired(self, user_id: Optional[str] = None) -> int:
-        return len(self.purge_expired_ids(user_id=user_id))
+    def purge_expired(self) -> int:
+        return len(self.purge_expired_ids())
 
-    def purge_expired_ids(self, user_id: Optional[str] = None) -> List[int]:
+    def purge_expired_ids(self) -> List[int]:
         conn = self._connect()
         try:
             rows = conn.execute("SELECT id, created_at, ttl_seconds FROM memories").fetchall()

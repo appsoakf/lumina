@@ -1,8 +1,7 @@
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from core.protocols import OrchestrationResult, RoutingIntent
-from core.tasks import TaskManager
-from core.tasks.models import TaskRecord
+from core.tasks import TaskManager, TaskRecord
 
 if TYPE_CHECKING:
     from core.agentic.chat_agent import ChatAgent
@@ -40,21 +39,19 @@ def execute_task_shortcut(
 
     task_id = ""
     if action == "cancel":
-        task = resolve_cancel_target(task_manager=task_manager, session_id=session_id)
+        task, ok = task_manager.cancel_current_task(session_id=session_id)
         if task is None:
             result_text = "当前没有可取消的任务。"
         else:
             task_id = task.task_id
-            ok = task_manager.cancel_task(task.task_id)
             result_text = f"已取消当前任务（{task.task_id}）。" if ok else f"当前任务 {task.task_id} 不可取消。"
     elif action == "retry":
-        task = resolve_retry_target(task_manager=task_manager, session_id=session_id)
+        task, ok = task_manager.retry_latest_task(session_id=session_id)
         if task is None:
             result_text = "当前没有可重试的任务。"
         else:
             task_id = task.task_id
-            retried = task_manager.retry_task(task.task_id)
-            result_text = f"已重试最近任务（{task.task_id}）。" if retried is not None else f"任务 {task.task_id} 重试失败。"
+            result_text = f"已重试最近任务（{task.task_id}）。" if ok else f"任务 {task.task_id} 重试失败。"
     else:
         result_text = "未知任务快捷指令。"
 

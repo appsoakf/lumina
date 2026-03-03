@@ -18,6 +18,7 @@ from core.llm.main import TranslateEngine
 from core.orchestrator import Orchestrator
 from core.tts.main import TTSEngine, TTSRequest
 from service.pet.pipeline import AudioChunk, EmotionContext, OrderedSentenceMap, SentenceSlot
+from service.pet.ws_contract import parse_user_text
 
 # --- logging ---
 logging.basicConfig(
@@ -30,7 +31,6 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # --- config ---
 app_config = load_app_config()
-username = app_config.service.username
 server_ip = app_config.service.server_address
 server_port = app_config.service.server_port
 
@@ -73,11 +73,11 @@ def sentence_worker(slot: SentenceSlot, emotion_ctx: EmotionContext, trace: Trac
         start = time.time()
 
         # 1) translate
-        ja_text = translator.translate(slot.chinese_text)
-        ok = bool(ja_text)
-        if translator.last_error is not None:
-            trace.log("translate_error", translator.last_error.to_payload())
-        if not ok:
+        translated = translator.translate_with_status(slot.chinese_text)
+        if translated.error is not None:
+            trace.log("translate_error", translated.error.to_payload())
+        ja_text = translated.text
+        if not translated.ok:
             ja_text = slot.chinese_text
 
         slot.japanese_text = ja_text
@@ -153,7 +153,6 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
         orchestrated = orchestrator.handle_user_message(
             user_text=user_text,
             session_id=session_id,
-            user_id=username,
         )
         full_reply = orchestrated.final_reply
 
@@ -267,8 +266,17 @@ def websocket_handler(ws):
             raw = ws.receive()
             if raw is None:
                 break
-            data = json.loads(raw)
-            user_text = data.get("content", "").strip()
+            user_text, request_error = parse_user_text(raw)
+            if request_error is not None:
+                trace.log("invalid_request", request_error.to_payload())
+                ws_send_error(
+                    ws,
+                    code=request_error.code,
+                    message=request_error.message,
+                    retryable=request_error.retryable,
+                    details=request_error.details,
+                )
+                continue
             if not user_text:
                 continue
             round_count += 1
@@ -289,6 +297,20 @@ def websocket_handler(ws):
         trace.close()
 
 
+def shutdown_runtime():
+    try:
+        orchestrator.close()
+    except Exception as exc:
+        logger.warning(f"Orchestrator close failed: {exc}")
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:
+        logger.warning(f"Executor shutdown failed: {exc}")
+
+
 def run_pet():
     logger.info(f"Pet service starting on {server_ip}:{server_port}")
-    app.run(host=server_ip, port=server_port, threaded=True)
+    try:
+        app.run(host=server_ip, port=server_port, threaded=True)
+    finally:
+        shutdown_runtime()

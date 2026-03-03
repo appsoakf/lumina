@@ -1,14 +1,15 @@
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
-from core.tasks.models import TaskRecord
+from core.paths import runtime_tasks_dir
+from core.tasks.record import TaskRecord
 
 
 class TaskStore:
-    def __init__(self, base_dir: str = "D:/lumina/runtime/tasks"):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: Optional[Union[str, Path]] = None):
+        self.base_dir = Path(base_dir) if base_dir is not None else runtime_tasks_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _task_path(self, task_id: str) -> Path:

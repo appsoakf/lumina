@@ -3,8 +3,9 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
+from core.paths import runtime_traces_dir
 
 class TraceLogger:
     """Async JSONL trace logger backed by queue + writer thread."""
@@ -13,11 +14,11 @@ class TraceLogger:
 
     def __init__(
         self,
-        trace_dir: str = "D:/lumina/runtime/traces",
+        trace_dir: Optional[Union[str, Path]] = None,
         session_id: str = "default",
         max_queue_size: int = 1024,
     ):
-        self.trace_dir = Path(trace_dir)
+        self.trace_dir = Path(trace_dir) if trace_dir is not None else runtime_traces_dir()
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.trace_dir / f"trace-{session_id}.jsonl"
 

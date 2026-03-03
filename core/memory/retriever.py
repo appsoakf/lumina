@@ -20,15 +20,15 @@ class MemoryRetriever:
     def __init__(self, store: LongTermMemoryStore):
         self.store = store
 
-    def get_profile(self, user_id: str = "", limit: int = 5) -> List[Dict]:
+    def get_profile(self, limit: int = 5) -> List[Dict]:
         return self.store.list_recent(memory_type=MemoryType.PROFILE, limit=limit)
 
-    def get_open_commitments(self, user_id: str = "", limit: int = 8) -> List[Dict]:
+    def get_open_commitments(self, limit: int = 8) -> List[Dict]:
         rows = self.store.list_recent(memory_type=MemoryType.COMMITMENT, limit=30)
         open_rows = [r for r in rows if (r.get("payload") or {}).get("status", "open") == "open"]
         return open_rows[:limit]
 
-    def search_relevant(self, user_id: str = "", query: str = "", limit: int = 6) -> List[Dict]:
+    def search_relevant(self, query: str = "", limit: int = 6) -> List[Dict]:
         query = (query or "").strip()
         if not query:
             return self.store.list_recent(memory_type=MemoryType.EPISODIC, limit=limit)

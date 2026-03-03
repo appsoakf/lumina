@@ -24,11 +24,13 @@ Lumina Memory 系统面向本地部署个人助手，核心目标：
 - `indexer.py`：异步向量入库队列与重试。
 - `hybrid_retriever.py`：关键词 + 向量混合召回与重排。
 - `service.py`：统一入口，供 orchestrator 调用。
+- 生命周期：`Orchestrator.close() -> MemoryService.close()` 已接入服务退出链路。
 
 单用户约束（已落地）：
 
 - `default_user_id` 固定，逻辑上不做多用户隔离。
-- 保留 `user_id` 参数仅做兼容，不参与检索分区。
+- `MemoryService`/`MemoryRetriever` 对外接口不再暴露 `user_id` 参数。
+- `user_id` 字段仅作为本地数据模型兼容字段保留（固定写入默认值）。
 
 ## 3. 数据模型
 
@@ -96,6 +98,10 @@ Orchestrator
 
 文件：`service/pet/config.json`
 
+运行目录：
+- 默认落盘到 `<project_root>/runtime/memory/memory.db`
+- 可通过环境变量 `LUMINA_RUNTIME_DIR` 统一覆盖 runtime 根目录
+
 ```json
 "memory_vector": {
   "enabled": false,
@@ -126,4 +132,3 @@ Orchestrator
 3. 优化混合召回策略：在召回阶段就做类型过滤，减少截断损失。
 4. 增加向量最小相关性阈值（`score_threshold`）降低噪音命中。
 5. 增加可观测性指标：`vector_hit_rate/fallback_count/embedding_latency/qdrant_latency`。
-6. 将 `MemoryService.close()` 接入服务生命周期，避免退出时队列残留。

@@ -2,12 +2,14 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+from core.paths import runtime_sessions_dir
 
 
 class ShortTermMemoryStore:
-    def __init__(self, session_dir: str = "D:/lumina/runtime/sessions"):
-        self.session_dir = Path(session_dir)
+    def __init__(self, session_dir: Optional[Union[str, Path]] = None):
+        self.session_dir = Path(session_dir) if session_dir is not None else runtime_sessions_dir()
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def _session_path(self, session_id: str) -> Path:

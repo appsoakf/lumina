@@ -1,11 +1,18 @@
 import argparse
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_RUNTIME = Path("D:/lumina/runtime")
-DEFAULT_BACKUP_DIR = Path("D:/lumina/backups")
+from core.paths import backups_root, runtime_root
+
+
+DEFAULT_RUNTIME = runtime_root()
+DEFAULT_BACKUP_DIR = backups_root()
 
 
 def backup_runtime(runtime_dir: Path, backup_dir: Path) -> Path:

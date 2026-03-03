@@ -1,5 +1,9 @@
 from .manager import TaskManager
-from .models import TaskRecord
+from .record import TaskRecord
 from .store import TaskStore
 
-__all__ = ["TaskRecord", "TaskStore", "TaskManager"]
+__all__ = [
+    "TaskRecord",
+    "TaskStore",
+    "TaskManager",
+]

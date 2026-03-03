@@ -96,7 +96,7 @@ class MemoryService:
         self.short_term_store.save_round(session_id=session_id, history=history, metadata=metadata or {})
         return self.get_recent_history(session_id=session_id, limit_messages=None)
 
-    def build_context(self, user_id: str = "", query: str = "") -> str:
+    def build_context(self, query: str = "") -> str:
         self._maybe_cleanup()
         profile = self.retriever.get_profile(limit=4)
         commitments = self.retriever.get_open_commitments(limit=4)
@@ -136,18 +136,14 @@ class MemoryService:
     def ingest_turn(
         self,
         session_id: str,
-        user_id: str,
         user_text: str,
         assistant_reply: str,
         meta: Optional[Dict] = None,
     ) -> None:
-        _ = user_id  # kept for backward-compatible call signature
         self._maybe_cleanup()
-        effective_user_id = self.default_user_id
 
         turn_item = self._build_turn_summary_item(
             session_id=session_id,
-            user_id=effective_user_id,
             user_text=user_text,
             assistant_reply=assistant_reply,
             meta=meta,
@@ -161,7 +157,7 @@ class MemoryService:
             for c in self.ingestor.extract_commitment_candidates(user_text):
                 rec = MemoryRecord(
                     memory_id=None,
-                    user_id=effective_user_id,
+                    user_id=self.default_user_id,
                     session_id=session_id,
                     memory_type=MemoryType.COMMITMENT,
                     content=c["content"],
@@ -178,7 +174,7 @@ class MemoryService:
             if plan:
                 rec = MemoryRecord(
                     memory_id=None,
-                    user_id=effective_user_id,
+                    user_id=self.default_user_id,
                     session_id=session_id,
                     memory_type=MemoryType.PROCEDURAL,
                     content=f"任务模板: {plan.get('goal', '')}",
@@ -191,14 +187,12 @@ class MemoryService:
     def _build_turn_summary_item(
         self,
         session_id: str,
-        user_id: str,
         user_text: str,
         assistant_reply: str,
         meta: Optional[Dict],
     ) -> Dict[str, object]:
         return {
             "session_id": session_id,
-            "user_id": user_id,
             "user_text": user_text or "",
             "assistant_reply": assistant_reply or "",
             "meta": meta or {},
@@ -208,21 +202,18 @@ class MemoryService:
         try:
             self._maybe_cleanup()
             session_id = str(item.get("session_id", "")).strip()
-            user_id = str(item.get("user_id", self.default_user_id)).strip() or self.default_user_id
             user_text = str(item.get("user_text", ""))
             assistant_reply = str(item.get("assistant_reply", ""))
             meta_obj = item.get("meta")
             meta = meta_obj if isinstance(meta_obj, dict) else {}
 
             self._persist_profile_candidates(
-                user_id=user_id,
                 session_id=session_id,
                 candidates=summary.profile_candidates,
                 meta=meta,
                 topic=summary.topic,
             )
             self._persist_topic_summary(
-                user_id=user_id,
                 session_id=session_id,
                 user_text=user_text,
                 assistant_reply=assistant_reply,
@@ -234,7 +225,6 @@ class MemoryService:
 
     def _persist_profile_candidates(
         self,
-        user_id: str,
         session_id: str,
         candidates: List[str],
         meta: Dict,
@@ -246,7 +236,7 @@ class MemoryService:
                 continue
             rec = MemoryRecord(
                 memory_id=None,
-                user_id=user_id,
+                user_id=self.default_user_id,
                 session_id=session_id,
                 memory_type=MemoryType.PROFILE,
                 content=content,
@@ -259,7 +249,6 @@ class MemoryService:
 
     def _persist_topic_summary(
         self,
-        user_id: str,
         session_id: str,
         user_text: str,
         assistant_reply: str,
@@ -273,7 +262,7 @@ class MemoryService:
         content = f"主题:{topic_text} | USER:{user_text[:120]} | ASSISTANT:{assistant_reply[:120]}"
         rec = MemoryRecord(
             memory_id=None,
-            user_id=user_id,
+            user_id=self.default_user_id,
             session_id=session_id,
             memory_type=MemoryType.EPISODIC,
             content=content,
@@ -284,8 +273,7 @@ class MemoryService:
         )
         self._add_if_not_duplicate(rec)
 
-    def cleanup_expired(self, user_id: Optional[str] = None) -> int:
-        _ = user_id  # kept for backward-compatible call signature
+    def cleanup_expired(self) -> int:
         expired_ids = self.long_term_store.purge_expired_ids()
         self._delete_vector_points(expired_ids)
         return len(expired_ids)
@@ -310,7 +298,6 @@ class MemoryService:
         rec.content_hash = self._hash_content(rec.memory_type, rec.content)
         window = self.policy.dedupe_window_seconds(rec.memory_type)
         existing_id = self.long_term_store.find_recent_duplicate_id(
-            user_id=None,
             memory_type=rec.memory_type,
             content_hash=rec.content_hash,
             window_seconds=window,

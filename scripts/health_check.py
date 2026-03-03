@@ -15,14 +15,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.config import load_app_config
+from core.paths import runtime_notes_dir, runtime_root, runtime_sessions_dir, runtime_tasks_dir, runtime_traces_dir
 
 
 RUNTIME_DIRS = [
-    Path("D:/lumina/runtime"),
-    Path("D:/lumina/runtime/sessions"),
-    Path("D:/lumina/runtime/traces"),
-    Path("D:/lumina/runtime/tasks"),
-    Path("D:/lumina/runtime/notes"),
+    runtime_root(),
+    runtime_sessions_dir(),
+    runtime_traces_dir(),
+    runtime_tasks_dir(),
+    runtime_notes_dir(),
 ]
 
 

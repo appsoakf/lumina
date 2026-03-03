@@ -1,7 +1,14 @@
 import argparse
 import json
+import sys
 from collections import Counter
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from core.paths import runtime_tasks_dir, runtime_traces_dir
 
 
 def _iter_jsonl(path: Path):
@@ -71,8 +78,8 @@ def summarize(trace_dir: Path, task_dir: Path) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize Lumina local metrics from traces/tasks")
-    parser.add_argument("--trace-dir", default="D:/lumina/runtime/traces")
-    parser.add_argument("--task-dir", default="D:/lumina/runtime/tasks")
+    parser.add_argument("--trace-dir", default=str(runtime_traces_dir()))
+    parser.add_argument("--task-dir", default=str(runtime_tasks_dir()))
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
