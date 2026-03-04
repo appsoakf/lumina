@@ -58,11 +58,10 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 7. `service` 调用 `orchestrator.record_session_round(...)` 落盘短期会话历史
 8. 输出走 emotion/translate/tts/audio streaming + trace
 
-### 4.1 Executor 按需 ReAct（step 内）
-- 默认策略：`react_mode=auto`
-  - 先做一次 direct pass（不带 tools）。
-  - 若输出可交付（`步骤状态: 成功/失败`）则直接返回，不进入工具循环。
-  - 若输出为 `需补充信息`（或明显信息不足）则升级到 ReAct。
+### 4.1 Executor 单通道 ReAct（step 内）
+- 默认策略：统一 ReAct 入口，模型在每轮自行决定“直接交付”或“发起工具调用”。
+- 执行器最终输出约束：模型先产出结构化 JSON（status/summary/evidence/details/risks/next_steps），
+  再由执行器统一转换为可读文本，避免对外暴露混杂技术信息。
 - ReAct 循环（有上限）：`DECIDE -> ACT(工具调用) -> OBSERVE(回填工具结果) -> DECIDE ...`
 - 保护策略：
   - `max_tool_rounds`：限制最大决策轮次；
@@ -73,7 +72,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 统一抽象：`BaseTool` 提供 schema、调用入口、参数错误归一化、重试钩子。
 - 注册中心：`ToolRegistry` 负责对外暴露 `list_schemas/call`，兼容 executor function-calling。
 - 默认工具集：`get_current_time`、`write_note`、`list_notes`、`web_search`。
-- `core/agentic/tools.py` 仅保留历史兼容导出，具体实现迁移至 `core/tools/*`。
+- 工具实现统一放在 `core/tools/*`，agent 侧直接依赖 `core.tools` 公共入口。
 
 ## 5. 持久化目录
 - 运行目录通过 `core/paths.py` 统一解析：
@@ -93,7 +92,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 错误码体系统一由 `core/utils/errors.py` 管理
 
 ## 7. 向量检索配置（可选）
-配置位于 `service/pet/config.json` 的 `memory_vector` 节点，关键项：
+配置位于项目根目录 `config.json` 的 `memory_vector` 节点，关键项：
 - `enabled`: 是否启用混合检索（默认 `false`）
 - `embedding_model` / `embedding_api_url` / `embedding_api_key`
 - `qdrant_url` / `qdrant_collection` / `vector_dim`
@@ -158,7 +157,7 @@ Client
 | `core/tools` (`BaseTool/ToolRegistry`) | tool schema + tool args + tool context | 统一工具抽象、注册、调用和错误归一化 | 标准化 `ToolResult` + callable tool schemas |
 | `PlannerAgent` | 任务请求 + 历史上下文 | 拆解执行步骤，输出 `steps + depends_on + input_bindings + graph_policy` | `PlanResult(goal, steps, graph_policy)` |
 | `LangGraphTaskRunner` | `task_id`, `plan`, `history`, `graph_policy` | 在 LangGraph 状态图内完成 ready 选择、步骤执行、失败阻断、取消检测和评审收敛 | `task_snapshot + step_results + first_error` |
-| `ExecutorAgent` | 单步任务输入 + 工具上下文 | 按需 ReAct：先直出，必要时进入工具循环并收敛 | `ExecutorRunResult(output_text, tool_events, error)` |
+| `ExecutorAgent` | 单步任务输入 + 工具上下文 | 单通道 ReAct：模型按需决定工具调用，最终以 JSON 归一化后输出可读文本 | `ExecutorRunResult(output_text, tool_events, error)` |
 | `CriticAgent` | `user_text`, `plan`, `execution_graph` | 质量评审，给出 `pass/revise` 与建议 | `CriticResult` |
 | `ChatAgent.reply_with_task_result` | 用户请求 + 执行总结 + history | 组织最终可读回复，补齐情绪 JSON 格式 | 最终回复文本（首行情绪 JSON） |
 | `MemoryService.ingest_turn` | `user_text`, `assistant_reply`, `meta` | commitment/procedural 同步写入；turn_summarizer 异步提取 topic/profile 并入库，失败时同步兜底 | 新增 memory 记录 ID（可多条） |

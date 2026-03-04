@@ -2,39 +2,29 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from core.tools import ToolContext, build_default_registry
 from core.agentic.base import BaseLLMAgent
-from core.utils.errors import ErrorCode, error_payload
+from core.agentic.json_mixin import JSONParseMixin
 from core.protocols import ExecutorRunResult
+from core.tools import ToolContext, build_default_registry
+from core.utils.errors import ErrorCode, error_payload
 
 logger = logging.getLogger(__name__)
 
 
-class ExecutorAgent(BaseLLMAgent):
-    """Task executor agent: function-calling + tool execution."""
+class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
+    """Task executor agent: unified ReAct loop with function-calling."""
 
-    REACT_MODE_AUTO = "auto"
-    REACT_MODE_ALWAYS = "always"
-    REACT_MODE_NEVER = "never"
+    STATUS_SUCCESS = "成功"
+    STATUS_FAILED = "失败"
+    STATUS_NEED_INFO = "需补充信息"
 
-    STEP_STATUS_SUCCESS = "成功"
-    STEP_STATUS_FAILED = "失败"
-    STEP_STATUS_NEED_INFO = "需补充信息"
-    STEP_STATUS_UNKNOWN = "unknown"
-
-    def __init__(
-        self,
-        max_tool_rounds: int = 4,
-        react_mode: str = REACT_MODE_AUTO,
-        max_repeated_tool_call: int = 2,
-    ):
+    def __init__(self, max_tool_rounds: int = 4, max_repeated_tool_call: int = 2):
         super().__init__(
             missing_key_message="Missing LLM API key for executor agent",
             missing_key_field="chat_api_key",
             default_temperature=0.2,
         )
         self.max_tool_rounds = max(int(max_tool_rounds), 1)
-        self.react_mode = self._normalize_react_mode(react_mode)
         self.max_repeated_tool_call = max(int(max_repeated_tool_call), 1)
         self.registry = build_default_registry()
 
@@ -54,7 +44,7 @@ class ExecutorAgent(BaseLLMAgent):
 【执行规则（必须严格遵守）】
 1. 只执行当前步骤，不跨步骤完成未来工作。
 2. 优先使用结构化输入绑定与已完成上下文，保持与任务图依赖一致。
-3. 信息不足时可以调用工具补齐事实；若仍不足，明确写出缺失项与影响。
+3. 信息不足时可自行决定是否调用工具补齐事实；信息足够时直接交付结果。
 4. 只能基于输入和工具真实返回结果作答，禁止编造事实或工具结果。
 5. 不暴露内部推理过程，仅输出结果与必要依据。
 
@@ -63,126 +53,32 @@ class ExecutorAgent(BaseLLMAgent):
 2. 工具参数要最小化且精确，避免宽泛查询。
 3. 工具失败时，明确失败原因、是否可重试、建议补充信息。
 
-【输出规则（必须严格遵守）】
-1. 输出纯文本，不要输出 JSON，不要使用 markdown 代码块。
-2. 输出必须包含以下 6 个字段标题，顺序固定：
-步骤状态:
-结果摘要:
-关键依据:
-产出详情:
-限制与风险:
-下一步建议:
-3. 若某项无内容，写“无”。
-
-【字段要求】
-1. 步骤状态
-- 仅允许：成功 / 失败 / 需补充信息。
-
-2. 结果摘要
-- 1-3 句，直接说明本步骤是否完成以及核心产出。
-
-3. 关键依据
-- 列出支撑结论的依据，可来自输入绑定、已完成上下文、工具返回。
-
-4. 产出详情
-- 给出可执行结果，如清单、参数、决策、草案内容或操作结果。
-
-5. 限制与风险
-- 说明边界条件、未覆盖范围、不确定性。
-
-6. 下一步建议
-- 给出对后续步骤可直接使用的建议；若无需建议写“无”。
+【最终输出规则（必须严格遵守）】
+1. 仅输出一个 JSON 对象，不输出其他文字，不使用 markdown 代码块。
+2. JSON 顶层字段固定为：
+{
+  "status": "success|failed|need_info",
+  "summary": "string",
+  "evidence": ["string"],
+  "details": ["string"],
+  "risks": ["string"],
+  "next_steps": ["string"]
+}
+3. 若某字段无内容，列表字段输出空数组，字符串字段输出空字符串。
+4. 若工具调用后信息仍不足，status 设为 need_info，并在 summary/next_steps 明确缺失项。
+5. 输出语言默认中文。
 
 【约束】
 1. 不输出情绪字段或情绪 JSON（如 emotion/mood/arousal）。
 2. 不输出与当前步骤无关的寒暄、角色扮演、口号化内容。
 3. 不得声称已完成未实际完成的动作。
-4. 语言简洁、明确、可执行，默认中文。
-
-【输出示例】
-步骤状态: 成功
-结果摘要: 已完成首页与登录接口可用性检查，核心链路可用。
-关键依据:
-- 工具 http_check 返回首页状态码 200
-- 工具 api_probe 返回 /login 状态码 200
-产出详情:
-- 首页延迟: 230ms
-- 登录接口: 正常
-- 建议监控项: 错误率、P95 延迟
-限制与风险:
-- 未覆盖高并发压测场景
-下一步建议:
-- 增加并发压测并记录 P95/P99
 """
-
-    def _normalize_react_mode(self, mode: str) -> str:
-        normalized = str(mode or "").strip().lower()
-        if normalized in {
-            self.REACT_MODE_AUTO,
-            self.REACT_MODE_ALWAYS,
-            self.REACT_MODE_NEVER,
-        }:
-            return normalized
-        logger.warning("Unknown react_mode=%s, fallback to auto", mode)
-        return self.REACT_MODE_AUTO
 
     def _build_messages(self, user_text: str, history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         messages.extend(history[-8:])
         messages.append({"role": "user", "content": user_text})
         return messages
-
-    def _extract_step_status(self, text: str) -> str:
-        for raw_line in str(text or "").splitlines():
-            line = raw_line.strip()
-            if not line.startswith("步骤状态"):
-                continue
-            _, _, rhs = line.replace("：", ":", 1).partition(":")
-            state_text = rhs.strip()
-            if self.STEP_STATUS_NEED_INFO in state_text:
-                return self.STEP_STATUS_NEED_INFO
-            if self.STEP_STATUS_SUCCESS in state_text:
-                return self.STEP_STATUS_SUCCESS
-            if self.STEP_STATUS_FAILED in state_text:
-                return self.STEP_STATUS_FAILED
-            return self.STEP_STATUS_UNKNOWN
-        return self.STEP_STATUS_UNKNOWN
-
-    def _looks_information_missing(self, text: str) -> bool:
-        payload = str(text or "")
-        signals = (
-            "需补充信息",
-            "信息不足",
-            "无法完成",
-            "无法判断",
-            "缺少",
-            "缺失",
-            "请补充",
-        )
-        return any(signal in payload for signal in signals)
-
-    def _is_deliverable_output(self, text: str) -> bool:
-        status = self._extract_step_status(text)
-        return status in {self.STEP_STATUS_SUCCESS, self.STEP_STATUS_FAILED}
-
-    def _should_upgrade_to_react(self, direct_text: str) -> bool:
-        status = self._extract_step_status(direct_text)
-        if status == self.STEP_STATUS_NEED_INFO:
-            return True
-        if status == self.STEP_STATUS_UNKNOWN and self._looks_information_missing(direct_text):
-            return True
-        return False
-
-    def _react_upgrade_instruction(self) -> str:
-        return (
-            "上一轮结论显示当前信息不足。"
-            "请在必要时调用工具补齐事实，再给出可交付的步骤结果。"
-        )
-
-    def _invoke_direct_pass(self, messages: List[Dict[str, Any]]) -> str:
-        resp = self.invoke_chat(messages=messages, temperature=0.2)
-        msg = resp.choices[0].message
-        return (msg.content or "").strip()
 
     def _tool_call_name(self, tool_call: Any) -> str:
         function = getattr(tool_call, "function", None)
@@ -221,6 +117,83 @@ class ExecutorAgent(BaseLLMAgent):
         encoded_args = json.dumps(tool_args, ensure_ascii=False, sort_keys=True)
         return f"{tool_name}|{encoded_args}"
 
+    def _normalize_status(self, raw_status: Any) -> str:
+        text = str(raw_status or "").strip().lower()
+        if text in {"success", "succeeded", "ok", "完成", "成功"}:
+            return self.STATUS_SUCCESS
+        if text in {"failed", "failure", "error", "失败"}:
+            return self.STATUS_FAILED
+        if text in {"need_info", "need-more-info", "missing_info", "需补充信息", "信息不足"}:
+            return self.STATUS_NEED_INFO
+        return self.STATUS_NEED_INFO
+
+    def _to_string_list(self, value: Any) -> List[str]:
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            return items
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        return []
+
+    def _extract_first_line(self, text: str) -> str:
+        for line in str(text or "").splitlines():
+            candidate = line.strip()
+            if candidate:
+                return candidate
+        return ""
+
+    def _parse_final_payload(self, text: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = self.parse_json_object(text, allow_brace_extract=True)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _fallback_render_text(self, raw_text: str) -> str:
+        first_line = self._extract_first_line(raw_text)
+        summary = first_line or "模型未返回结构化结果，已保留原始内容。"
+        detail = str(raw_text or "").strip() or "无"
+        return (
+            f"步骤状态: {self.STATUS_NEED_INFO}\n"
+            f"结果摘要: {summary}\n"
+            "关键依据:\n无\n"
+            f"产出详情:\n{detail}\n"
+            "限制与风险:\n无\n"
+            "下一步建议:\n- 请补充更具体约束或允许调用更多工具"
+        )
+
+    def _render_final_text(self, payload: Dict[str, Any], raw_text: str) -> str:
+        status = self._normalize_status(payload.get("status"))
+        summary = str(payload.get("summary") or "").strip()
+        if not summary:
+            summary = self._extract_first_line(raw_text) or "无"
+
+        evidence = self._to_string_list(payload.get("evidence"))
+        details = self._to_string_list(payload.get("details"))
+        risks = self._to_string_list(payload.get("risks"))
+        next_steps = self._to_string_list(payload.get("next_steps"))
+
+        evidence_text = "\n".join(f"- {item}" for item in evidence) if evidence else "无"
+        details_text = "\n".join(f"- {item}" for item in details) if details else "无"
+        risks_text = "\n".join(f"- {item}" for item in risks) if risks else "无"
+        next_text = "\n".join(f"- {item}" for item in next_steps) if next_steps else "无"
+
+        return (
+            f"步骤状态: {status}\n"
+            f"结果摘要: {summary}\n"
+            f"关键依据:\n{evidence_text}\n"
+            f"产出详情:\n{details_text}\n"
+            f"限制与风险:\n{risks_text}\n"
+            f"下一步建议:\n{next_text}"
+        )
+
+    def _normalize_final_output(self, raw_text: str) -> str:
+        payload = self._parse_final_payload(raw_text)
+        if payload is None:
+            return self._fallback_render_text(raw_text)
+        return self._render_final_text(payload, raw_text=raw_text)
+
     def _run_react_loop(
         self,
         *,
@@ -228,11 +201,12 @@ class ExecutorAgent(BaseLLMAgent):
         ctx: ToolContext,
         tool_events: List[Dict[str, Any]],
     ) -> ExecutorRunResult:
+        # 记录“工具名+参数”签名出现次数，避免模型陷入重复调用死循环。
         repeated_call_counter: Dict[str, int] = {}
         tool_schemas = self.registry.list_schemas()
 
-        # ReAct state machine:
-        # DECIDE(model) -> ACT(call tools) -> OBSERVE(tool outputs) -> DECIDE ...
+        # ReAct 状态机：
+        # DECIDE(模型决策) -> ACT(执行工具) -> OBSERVE(回填工具结果) -> DECIDE ...
         for _ in range(self.max_tool_rounds):
             resp = self.invoke_chat(
                 messages=messages,
@@ -244,6 +218,7 @@ class ExecutorAgent(BaseLLMAgent):
             tool_calls = list(getattr(msg, "tool_calls", None) or [])
 
             if tool_calls:
+                # 先把 assistant 的 tool_calls 消息写入上下文，再逐个执行工具并写回 observation。
                 messages.append(
                     {
                         "role": "assistant",
@@ -284,9 +259,11 @@ class ExecutorAgent(BaseLLMAgent):
                     )
                 continue
 
+            # 没有 tool_calls 时，若模型给出文本则作为最终可交付结果并统一规范化。
             text = (msg.content or "").strip()
             if text:
-                return ExecutorRunResult(output_text=text, tool_events=tool_events)
+                normalized_text = self._normalize_final_output(text)
+                return ExecutorRunResult(output_text=normalized_text, tool_events=tool_events)
 
         return ExecutorRunResult(
             output_text="任务执行未收敛，请用户补充更具体要求。",
@@ -309,28 +286,7 @@ class ExecutorAgent(BaseLLMAgent):
         messages = self._build_messages(user_text=user_text, history=history)
 
         try:
-            if self.react_mode != self.REACT_MODE_ALWAYS:
-                direct_text = self._invoke_direct_pass(messages=messages)
-                if direct_text:
-                    if self.react_mode == self.REACT_MODE_NEVER:
-                        return ExecutorRunResult(output_text=direct_text, tool_events=tool_events)
-                    if self._is_deliverable_output(direct_text):
-                        return ExecutorRunResult(output_text=direct_text, tool_events=tool_events)
-                    if not self._should_upgrade_to_react(direct_text):
-                        return ExecutorRunResult(output_text=direct_text, tool_events=tool_events)
-                    messages.append({"role": "assistant", "content": direct_text})
-                    messages.append({"role": "user", "content": self._react_upgrade_instruction()})
-                elif self.react_mode == self.REACT_MODE_NEVER:
-                    return ExecutorRunResult(
-                        output_text="任务执行失败。",
-                        tool_events=tool_events,
-                        error=error_payload(
-                            code=ErrorCode.TOOL_EXECUTION_ERROR,
-                            message="Executor direct pass returned empty response",
-                            retryable=True,
-                        ),
-                    )
-
+            # 单通道入口：始终通过统一 ReAct 循环收敛，不再分 direct-pass 与升级路径。
             return self._run_react_loop(messages=messages, ctx=ctx, tool_events=tool_events)
         except Exception as exc:
             logger.error(f"Executor run failed: {exc}")
@@ -343,3 +299,4 @@ class ExecutorAgent(BaseLLMAgent):
                     retryable=True,
                 ),
             )
+

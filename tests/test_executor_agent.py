@@ -8,19 +8,20 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.agentic.executor_agent import ExecutorAgent
-from core.agentic.tools import ToolResult
+from core.tools import ToolResult
 from core.utils.errors import ErrorCode
 
 
-def _step_output(status: str) -> str:
-    return (
-        f"步骤状态: {status}\n"
-        "结果摘要: 摘要\n"
-        "关键依据: 无\n"
-        "产出详情: 无\n"
-        "限制与风险: 无\n"
-        "下一步建议: 无"
-    )
+def _executor_json(status: str, summary: str = "摘要") -> str:
+    payload = {
+        "status": status,
+        "summary": summary,
+        "evidence": [],
+        "details": [],
+        "risks": [],
+        "next_steps": [],
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class _FakeToolFunction:
@@ -93,12 +94,10 @@ class _ExecutorAgentHarness(ExecutorAgent):
         self,
         *,
         scripted_messages,
-        react_mode=ExecutorAgent.REACT_MODE_AUTO,
         max_tool_rounds=4,
         max_repeated_tool_call=2,
     ):
         self.max_tool_rounds = max_tool_rounds
-        self.react_mode = self._normalize_react_mode(react_mode)
         self.max_repeated_tool_call = max_repeated_tool_call
         self.registry = _FakeToolRegistry()
         self._scripted_messages = list(scripted_messages)
@@ -125,40 +124,37 @@ class ExecutorAgentPromptTests(unittest.TestCase):
         prompt = ExecutorAgent._system_prompt(ExecutorAgent.__new__(ExecutorAgent))
 
         self.assertIn("你的唯一职责", prompt)
-        self.assertIn("【输出规则（必须严格遵守）】", prompt)
-        self.assertIn("【字段要求】", prompt)
-        self.assertIn("步骤状态:", prompt)
+        self.assertIn("【最终输出规则（必须严格遵守）】", prompt)
+        self.assertIn("仅输出一个 JSON 对象", prompt)
+        self.assertIn("\"status\": \"success|failed|need_info\"", prompt)
         self.assertIn("【工具调用规则】", prompt)
         self.assertIn("不输出情绪字段或情绪 JSON", prompt)
-        self.assertIn("【输出示例】", prompt)
 
 
-class ExecutorAgentReactModeTests(unittest.TestCase):
-    def test_auto_mode_returns_direct_output_when_deliverable(self):
+class ExecutorAgentReactLoopTests(unittest.TestCase):
+    def test_react_loop_returns_direct_output_without_tool_calls(self):
         agent = _ExecutorAgentHarness(
-            scripted_messages=[_FakeMessage(content=_step_output("成功"))],
-            react_mode=ExecutorAgent.REACT_MODE_AUTO,
+            scripted_messages=[_FakeMessage(content=_executor_json("success", "已完成"))],
         )
 
         result = agent.run_task(user_text="test", history=[], session_id="s1")
 
         self.assertIsNone(result.error)
         self.assertIn("步骤状态: 成功", result.output_text)
+        self.assertIn("结果摘要: 已完成", result.output_text)
         self.assertEqual(result.tool_events, [])
         self.assertEqual(len(agent.invocations), 1)
-        self.assertIsNone(agent.invocations[0].get("tools"))
+        self.assertIsNotNone(agent.invocations[0].get("tools"))
 
-    def test_auto_mode_upgrades_to_react_when_need_more_info(self):
+    def test_react_loop_calls_tool_then_returns_output(self):
         agent = _ExecutorAgentHarness(
             scripted_messages=[
-                _FakeMessage(content=_step_output("需补充信息")),
                 _FakeMessage(
                     content="先查时间",
                     tool_calls=[_FakeToolCall("c1", "get_current_time", '{"timezone":"UTC"}')],
                 ),
-                _FakeMessage(content=_step_output("成功")),
+                _FakeMessage(content=_executor_json("success", "工具调用后完成")),
             ],
-            react_mode=ExecutorAgent.REACT_MODE_AUTO,
             max_tool_rounds=3,
         )
 
@@ -166,34 +162,18 @@ class ExecutorAgentReactModeTests(unittest.TestCase):
 
         self.assertIsNone(result.error)
         self.assertIn("步骤状态: 成功", result.output_text)
+        self.assertIn("结果摘要: 工具调用后完成", result.output_text)
         self.assertEqual(len(result.tool_events), 1)
         self.assertEqual(result.tool_events[0]["tool"], "get_current_time")
         self.assertEqual(len(agent.registry.calls), 1)
-        self.assertEqual(len(agent.invocations), 3)
-        self.assertIsNone(agent.invocations[0].get("tools"))
-        self.assertIsNotNone(agent.invocations[1].get("tools"))
+        self.assertEqual(len(agent.invocations), 2)
 
-    def test_never_mode_keeps_direct_answer_without_tool_calls(self):
-        agent = _ExecutorAgentHarness(
-            scripted_messages=[_FakeMessage(content=_step_output("需补充信息"))],
-            react_mode=ExecutorAgent.REACT_MODE_NEVER,
-        )
-
-        result = agent.run_task(user_text="test", history=[], session_id="s1")
-
-        self.assertIsNone(result.error)
-        self.assertIn("步骤状态: 需补充信息", result.output_text)
-        self.assertEqual(result.tool_events, [])
-        self.assertEqual(len(agent.invocations), 1)
-        self.assertIsNone(agent.invocations[0].get("tools"))
-
-    def test_always_mode_returns_error_when_rounds_exceeded(self):
+    def test_react_loop_returns_error_when_rounds_exceeded(self):
         agent = _ExecutorAgentHarness(
             scripted_messages=[
                 _FakeMessage(tool_calls=[_FakeToolCall("c1", "get_current_time", '{"timezone":"UTC"}')]),
                 _FakeMessage(tool_calls=[_FakeToolCall("c2", "get_current_time", '{"timezone":"UTC"}')]),
             ],
-            react_mode=ExecutorAgent.REACT_MODE_ALWAYS,
             max_tool_rounds=2,
         )
 
@@ -204,7 +184,6 @@ class ExecutorAgentReactModeTests(unittest.TestCase):
         self.assertIn("exceeded", str(result.error.get("message", "")))
         self.assertEqual(len(result.tool_events), 2)
         self.assertEqual(len(agent.invocations), 2)
-        self.assertIsNotNone(agent.invocations[0].get("tools"))
 
     def test_react_loop_detects_repeated_tool_call_stall(self):
         agent = _ExecutorAgentHarness(
@@ -212,7 +191,6 @@ class ExecutorAgentReactModeTests(unittest.TestCase):
                 _FakeMessage(tool_calls=[_FakeToolCall("c1", "get_current_time", '{"timezone":"UTC"}')]),
                 _FakeMessage(tool_calls=[_FakeToolCall("c2", "get_current_time", '{"timezone":"UTC"}')]),
             ],
-            react_mode=ExecutorAgent.REACT_MODE_ALWAYS,
             max_tool_rounds=4,
             max_repeated_tool_call=1,
         )
@@ -223,6 +201,17 @@ class ExecutorAgentReactModeTests(unittest.TestCase):
         self.assertEqual(result.error.get("code"), ErrorCode.TOOL_EXECUTION_ERROR.value)
         self.assertIn("loop detected", str(result.error.get("message", "")))
         self.assertEqual(len(result.tool_events), 1)
+
+    def test_react_loop_fallbacks_to_normalized_text_when_model_not_json(self):
+        agent = _ExecutorAgentHarness(
+            scripted_messages=[_FakeMessage(content="我已经做完了，建议下一步继续。")],
+        )
+
+        result = agent.run_task(user_text="test", history=[], session_id="s1")
+
+        self.assertIsNone(result.error)
+        self.assertIn("步骤状态: 需补充信息", result.output_text)
+        self.assertIn("产出详情:", result.output_text)
 
 
 if __name__ == "__main__":

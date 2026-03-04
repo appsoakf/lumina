@@ -132,8 +132,36 @@ class Orchestrator:
             critic_agent=critic_agent,
         )
 
+    def _extract_step_summary(self, output_text: object) -> str:
+        text = str(output_text or "").strip()
+        if not text:
+            return ""
+
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                summary = str(payload.get("summary") or "").strip()
+                if summary:
+                    return summary
+        except Exception:
+            pass
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("结果摘要"):
+                _, _, rhs = line.replace("：", ":", 1).partition(":")
+                summary = rhs.strip()
+                if summary:
+                    return summary
+            if line.startswith("步骤状态"):
+                continue
+            return line
+        return ""
+
     def _compose_general_executor_output(self, task_snapshot: Dict[str, object], critic: CriticResult) -> str:
-        lines = [f"任务目标: {task_snapshot.get('goal', '')}", "", "执行结果:"]
+        lines = [f"任务目标: {task_snapshot.get('goal', '')}", "", "执行进展:"]
         for node in task_snapshot.get("nodes") or []:
             state_value = str(node.get("state") or "")
             state_text = {
@@ -146,12 +174,18 @@ class Orchestrator:
                 "cancelled": "已取消",
                 "skipped": "跳过",
             }.get(state_value, state_value)
-            lines.append(f"- [{node.get('step_id')}] {node.get('title', '')} ({state_text})")
-            if node.get("output_text"):
-                lines.append(f"  结果: {node.get('output_text')}")
+
+            step_title = str(node.get("title") or "").strip() or str(node.get("step_id") or "步骤")
+            lines.append(f"- {step_title}：{state_text}")
+
+            summary = self._extract_step_summary(node.get("output_text"))
+            if summary:
+                lines.append(f"  说明: {summary}")
+
             if node.get("error"):
                 err = node.get("error") or {}
-                lines.append(f"  错误: {err.get('code')} | {err.get('message')}")
+                message = str(err.get("message") or "").strip() or "该步骤执行未完成。"
+                lines.append(f"  问题: {message}")
 
         if critic.summary:
             lines.extend(["", f"评审结论: {critic.summary}"])

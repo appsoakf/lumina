@@ -4,3 +4,7 @@ __pycache__/
 
 # Local contributor notes
 AGENTS.md
+runtime
+.vscode
+.claude
+config.json

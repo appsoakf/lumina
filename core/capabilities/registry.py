@@ -10,7 +10,9 @@ class CapabilitySpec:
 
 
 class CapabilityRegistry:
-    """Minimal dynamic routing registry for agents."""
+    """
+    agents的动态路由注册表，允许根据能力名称找到对应的agent_name
+    """
 
     def __init__(self):
         self._specs: Dict[str, CapabilitySpec] = {}
@@ -32,7 +34,7 @@ class CapabilityRegistry:
 def build_default_registry() -> CapabilityRegistry:
     r = CapabilityRegistry()
     r.register(CapabilitySpec(agent_name="chat_agent", capabilities=["chat", "response_compose"], priority=10))
-    r.register(CapabilitySpec(agent_name="planner_agent", capabilities=["task_planning", "travel_planning"], priority=20))
+    r.register(CapabilitySpec(agent_name="planner_agent", capabilities=["task_planning"], priority=20))
     r.register(CapabilitySpec(agent_name="executor_agent", capabilities=["task_execution", "tool_execution"], priority=30))
     r.register(CapabilitySpec(agent_name="critic_agent", capabilities=["task_review"], priority=40))
     return r

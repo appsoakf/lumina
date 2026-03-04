@@ -96,7 +96,7 @@ Orchestrator
 
 ## 6. 配置
 
-文件：`service/pet/config.json`
+文件：项目根目录 `config.json`
 
 运行目录：
 - 默认落盘到 `<project_root>/runtime/memory/memory.db`
