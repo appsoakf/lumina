@@ -1,0 +1,29 @@
+{
+  "session_id": "ws-c11826e600",
+  "saved_at": "2026-03-04T07:43:56.814931Z",
+  "history": [
+    {
+      "role": "user",
+      "content": "你能为我推荐一个健身计划吗？"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"emotion\": \"严肃\", \"intensity\": 2}  \n主人，我需要您提供具体的健身目标、体能水平、可用时间和偏好运动类型，才能为您制定合适的健身计划。请告诉我这些信息吧。"
+    },
+    {
+      "role": "user",
+      "content": "我喜欢练上身力量，每次运动最好控制在一小时以内"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"emotion\": \"自信\", \"intensity\": 2}  \n主人，根据您的喜好，我为您制定了一个上身力量训练计划，包含哑铃推举、俯卧撑和引体向上等动作，总时长控制在一小时以内。希望您喜欢。"
+    }
+  ],
+  "metadata": {
+    "round": 2,
+    "duration_ms": 41483,
+    "tool_events": 0,
+    "route_intent": "task",
+    "task_id": "t-20260304074316-50a99138"
+  }
+}

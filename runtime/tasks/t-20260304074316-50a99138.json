@@ -1,0 +1,68 @@
+{
+  "task_id": "t-20260304074316-50a99138",
+  "session_id": "ws-c11826e600",
+  "user_text": "我喜欢练上身力量，每次运动最好控制在一小时以内",
+  "state": "succeeded",
+  "plan": {
+    "goal": "为用户推荐一个健身计划",
+    "steps": [
+      {
+        "step_id": "S1",
+        "title": "收集用户信息",
+        "instruction": "询问用户的健身目标、体能水平、可用时间以及是否有其他偏好运动类型。",
+        "depends_on": [],
+        "input_bindings": []
+      },
+      {
+        "step_id": "S2",
+        "title": "生成健身计划",
+        "instruction": "根据用户提供的信息，生成一个专注于上身力量训练、时长在一小时以内的健身计划。",
+        "depends_on": [
+          "S1"
+        ],
+        "input_bindings": [
+          {
+            "from": "S1.output_text",
+            "to": "user_info"
+          }
+        ]
+      }
+    ],
+    "raw_text": "{\n  \"goal\": \"为用户推荐一个健身计划\",\n  \"graph_policy\": {\n    \"max_parallelism\": 1,\n    \"fail_fast\": true\n  },\n  \"steps\": [\n    {\n      \"title\": \"收集用户信息\",\n      \"instruction\": \"询问用户的健身目标、体能水平、可用时间以及是否有其他偏好运动类型。\",\n      \"depends_on\": [],\n      \"input_bindings\": []\n    },\n    {\n      \"title\": \"生成健身计划\",\n      \"instruction\": \"根据用户提供的信息，生成一个专注于上身力量训练、时长在一小时以内的健身计划。\",\n      \"depends_on\": [\"S1\"],\n      \"input_bindings\": [\n        {\"from\": \"S1.output_text\", \"to\": \"user_info\"}\n      ]\n    }\n  ]\n}",
+    "error": null,
+    "graph_policy": {
+      "max_parallelism": 1,
+      "fail_fast": true
+    }
+  },
+  "step_results": [
+    {
+      "step_id": "S1",
+      "title": "收集用户信息",
+      "depends_on": [],
+      "input_bindings": [],
+      "state": "succeeded",
+      "output_text": "步骤状态: 成功\n结果摘要: 用户已提供健身偏好为喜欢练上身力量，且每次运动控制在一小时以内。\n关键依据:\n- 用户明确表示喜欢练上身力量\n产出详情:\n- 用户当前步骤为收集信息，已明确健身目标为上身力量训练，且时间限制为一小时以内。\n限制与风险:\n无\n下一步建议:\n- S2 生成健身计划",
+      "error": null
+    },
+    {
+      "step_id": "S2",
+      "title": "生成健身计划",
+      "depends_on": [
+        "S1"
+      ],
+      "input_bindings": [
+        {
+          "from": "S1.output_text",
+          "to": "user_info"
+        }
+      ],
+      "state": "succeeded",
+      "output_text": "步骤状态: 成功\n结果摘要: 根据用户偏好，生成了一个专注于上身力量训练、时长在一小时以内的健身计划。\n关键依据:\n- 用户明确表示喜欢练上身力量\n- 用户要求每次运动控制在一小时以内\n产出详情:\n- 健身计划包括上半身力量训练动作，如俯卧撑、哑铃划船、肩推等\n- 每个训练动作建议进行3组，每组12-15次\n限制与风险:\n无\n下一步建议:\n- S3 提供健身计划详情",
+      "error": null
+    }
+  ],
+  "error": null,
+  "created_at": "2026-03-04T07:43:16.145866+00:00",
+  "updated_at": "2026-03-04T07:43:44.688067+00:00"
+}

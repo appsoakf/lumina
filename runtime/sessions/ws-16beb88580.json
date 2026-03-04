@@ -1,0 +1,29 @@
+{
+  "session_id": "ws-16beb88580",
+  "saved_at": "2026-03-04T05:11:23.070453Z",
+  "history": [
+    {
+      "role": "user",
+      "content": "你好"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"emotion\": \"开心\", \"intensity\": 2}  \n主人好呀，今天有什么需要我帮忙的吗？"
+    },
+    {
+      "role": "user",
+      "content": "你能帮我总结今天有关于ai领域的新闻吗？"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"emotion\": \"失落\", \"intensity\": 2}  \n主人，看来今天无法获取AI领域的新闻，可能是网络问题。我建议稍后再试一次。"
+    }
+  ],
+  "metadata": {
+    "round": 2,
+    "duration_ms": 58724,
+    "tool_events": 1,
+    "route_intent": "task",
+    "task_id": "t-20260304051025-a6a61769"
+  }
+}
