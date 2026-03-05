@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from core.utils.errors import AppError, ErrorCode
 
@@ -67,6 +67,19 @@ class WebSearchConfig:
 
 
 @dataclass
+class FileIOConfig:
+    enabled: bool
+    allow_any_absolute_path: bool
+    allowed_roots: List[str]
+    allowed_read_exts: List[str]
+    allowed_write_exts: List[str]
+    max_file_bytes: int
+    max_chars: int
+    max_pdf_pages: int
+    default_encoding: str
+
+
+@dataclass
 class UapiSearchConfig:
     endpoint: str
     api_key: str
@@ -77,6 +90,7 @@ class UapiSearchConfig:
 @dataclass
 class ToolsConfig:
     web_search: WebSearchConfig
+    file_io: FileIOConfig
 
 
 @dataclass
@@ -182,6 +196,47 @@ def _to_float(value: Any, path: str) -> float:
             "Invalid float config value",
             details={"field": path, "value": value},
         )
+
+
+def _to_str_list(value: Any, path: str) -> List[str]:
+    if not isinstance(value, list):
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "Invalid list config value",
+            details={"field": path, "value": value},
+        )
+    items: List[str] = []
+    for raw in value:
+        text = str(raw).strip()
+        if text:
+            items.append(text)
+    return items
+
+
+def _normalize_ext_list(value: Any, path: str) -> List[str]:
+    items = _to_str_list(value, path)
+    normalized: List[str] = []
+    seen = set()
+    for raw in items:
+        ext = str(raw).strip().lower()
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        if len(ext) <= 1:
+            raise AppError(
+                ErrorCode.CONFIG_INVALID,
+                "Invalid extension config value",
+                details={"field": path, "value": raw},
+            )
+        if ext not in seen:
+            seen.add(ext)
+            normalized.append(ext)
+    if not normalized:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "Extension list cannot be empty",
+            details={"field": path},
+        )
+    return normalized
 
 
 def _build_llm_config(raw: Dict[str, Any]) -> LLMConfig:
@@ -409,6 +464,74 @@ def _build_web_search_config(raw: Dict[str, Any]) -> WebSearchConfig:
     )
 
 
+def _build_file_io_config(raw: Optional[Dict[str, Any]]) -> FileIOConfig:
+    payload = dict(raw or {})
+
+    enabled = _to_bool(payload.get("enabled", True), "tools.file_io.enabled")
+    allow_any_absolute_path = _to_bool(
+        payload.get("allow_any_absolute_path", False),
+        "tools.file_io.allow_any_absolute_path",
+    )
+    allowed_roots = _to_str_list(
+        payload.get("allowed_roots", ["$PROJECT", "$RUNTIME"]),
+        "tools.file_io.allowed_roots",
+    )
+    if not allowed_roots:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "tools.file_io.allowed_roots cannot be empty",
+            details={"field": "tools.file_io.allowed_roots"},
+        )
+
+    allowed_read_exts = _normalize_ext_list(
+        payload.get(
+            "allowed_read_exts",
+            [".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".log", ".py", ".pdf"],
+        ),
+        "tools.file_io.allowed_read_exts",
+    )
+    allowed_write_exts = _normalize_ext_list(
+        payload.get("allowed_write_exts", [".md"]),
+        "tools.file_io.allowed_write_exts",
+    )
+
+    max_file_bytes = _to_int(payload.get("max_file_bytes", 2 * 1024 * 1024), "tools.file_io.max_file_bytes")
+    max_chars = _to_int(payload.get("max_chars", 12000), "tools.file_io.max_chars")
+    max_pdf_pages = _to_int(payload.get("max_pdf_pages", 20), "tools.file_io.max_pdf_pages")
+    default_encoding = str(payload.get("default_encoding", "utf-8")).strip() or "utf-8"
+
+    if max_file_bytes <= 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "tools.file_io.max_file_bytes must be > 0",
+            details={"field": "tools.file_io.max_file_bytes", "value": max_file_bytes},
+        )
+    if max_chars <= 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "tools.file_io.max_chars must be > 0",
+            details={"field": "tools.file_io.max_chars", "value": max_chars},
+        )
+    if max_pdf_pages <= 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "tools.file_io.max_pdf_pages must be > 0",
+            details={"field": "tools.file_io.max_pdf_pages", "value": max_pdf_pages},
+        )
+
+    return FileIOConfig(
+        enabled=enabled,
+        allow_any_absolute_path=allow_any_absolute_path,
+        allowed_roots=allowed_roots,
+        allowed_read_exts=allowed_read_exts,
+        allowed_write_exts=allowed_write_exts,
+        max_file_bytes=max_file_bytes,
+        max_chars=max_chars,
+        max_pdf_pages=max_pdf_pages,
+        default_encoding=default_encoding,
+    )
+
+
 def _build_tools_config(raw: Dict[str, Any]) -> ToolsConfig:
     web_search_raw = raw.get("web_search")
     if not isinstance(web_search_raw, dict):
@@ -417,7 +540,17 @@ def _build_tools_config(raw: Dict[str, Any]) -> ToolsConfig:
             "Missing required tools.web_search config section",
             details={"field": "tools.web_search"},
         )
-    return ToolsConfig(web_search=_build_web_search_config(web_search_raw))
+    file_io_raw = raw.get("file_io")
+    if file_io_raw is not None and not isinstance(file_io_raw, dict):
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "tools.file_io must be an object",
+            details={"field": "tools.file_io"},
+        )
+    return ToolsConfig(
+        web_search=_build_web_search_config(web_search_raw),
+        file_io=_build_file_io_config(file_io_raw),
+    )
 
 
 def _build_logging_config(raw: Dict[str, Any]) -> LoggingConfig:
