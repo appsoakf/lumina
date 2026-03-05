@@ -54,9 +54,12 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 3. orchestrator 通过 `MemoryService.get_recent_history` + `build_context` 组装上下文
 4. orchestrator 处理任务快捷指令；其余请求执行 chat/task 路由
 5. task 模式下由 `LangGraphTaskRunner` 依据 `depends_on` / `input_bindings` / `graph_policy` 调度执行，`TaskManager` 持续跟踪状态
+   - 若某一步返回“需补充信息”，任务进入 `waiting_user_input`，对外返回追问信息并暂停后续步骤
+   - 用户补充后在同一 `task_id` 上恢复执行，不重新创建任务
+   - 对可重试失败触发有界 replan 循环；超出预算返回 `TASK_NOT_CONVERGED`
 6. orchestrator 在回合内沉淀长期记忆；主题/偏好由异步总结器入库，向量检索启用时异步 upsert Qdrant
 7. `service` 调用 `orchestrator.record_session_round(...)` 落盘短期会话历史
-8. 输出走 emotion/translate/tts/audio streaming + trace
+8. 输出走 emotion +（可选）translate +（可选）tts/audio streaming + trace（由 `service.enable_translation`、`service.enable_tts` 控制）
 
 ### 4.1 Executor 单通道 ReAct（step 内）
 - 默认策略：统一 ReAct 入口，模型在每轮自行决定“直接交付”或“发起工具调用”。
@@ -83,10 +86,30 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
   - `runtime/tasks/` 任务状态
   - `runtime/sessions/` 会话快照
   - `runtime/traces/` 事件追踪
+  - `runtime/logs/` 统一结构化日志（`events.jsonl`）与文本日志
   - `runtime/notes/` 工具输出
 
+## 5.1 日志与可观测性（2026-03）
+- 配置入口：`config.json -> logging`（由 `core/config.py` 解析为 `LoggingConfig`）。
+- 启动入口：`service/pet/main.py` 在服务初始化时调用 `setup_logging(...)`。
+- 输出形态：
+  - 人类可读日志（控制台/文件）
+  - 结构化 JSONL（`runtime/logs/events.jsonl`）
+  - 兼容 trace（`runtime/traces/trace-*.jsonl`，保留旧链路）
+- 上下文注入：通过 `log_context` 自动附加 `session_id/round/task_id/step_id`。
+- 关键埋点：
+  - `ws.round.start/end`
+  - `orchestrator.route.done`
+  - `llm.invoke.done` / `llm.stream.open`
+  - `tool.call.*`
+  - `tts.request.*` / `tts.stream.end`
+  - `task.step.run.done/error`
+- 异常规范：
+  - 统一使用结构化异常事件（包含 `file/line/func/exception_type/traceback`）。
+  - 降级场景（fallback）必须保留可观测事件，不静默吞错。
+
 ## 6. 协议与状态
-- `TaskState`: `pending/running/succeeded/failed/cancelled`
+- `TaskState`: `pending/running/waiting_user_input/succeeded/failed/cancelled`
 - `StepState`: `pending/ready/running/succeeded/failed/cancelled/blocked/skipped`
 - `OrchestrationResult`: 兼容原接口，包含 `intent/final_reply/executor_result/meta`
 - 错误码体系统一由 `core/utils/errors.py` 管理
@@ -100,6 +123,13 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - `write_async` / `queue_size` / `max_retries`
 
 当 `enabled=false` 或向量链路异常时，系统自动回退到关键词检索。
+
+## 7.1 任务收敛配置（task_flow）
+`config.json` 可选配置：
+- `task_flow.max_replan_rounds`（默认 2）：单轮用户请求内允许的自动 replan 次数上限
+- `task_flow.max_clarify_rounds`（默认 3）：同一任务等待用户补充的最大轮次上限
+
+超限后任务会标记为 `failed`，错误码 `TASK_NOT_CONVERGED`（`retryable=true`）。
 
 ## 8. 设计边界（简洁版）
 - 当前为单用户架构：逻辑上固定 `default_user_id`，不做多用户隔离
@@ -162,7 +192,7 @@ Client
 | `ChatAgent.reply_with_task_result` | 用户请求 + 执行总结 + history | 组织最终可读回复，补齐情绪 JSON 格式 | 最终回复文本（首行情绪 JSON） |
 | `MemoryService.ingest_turn` | `user_text`, `assistant_reply`, `meta` | commitment/procedural 同步写入；turn_summarizer 异步提取 topic/profile 并入库，失败时同步兜底 | 新增 memory 记录 ID（可多条） |
 | `MemoryVectorIndexer`（可选） | `memory_id`, `content`, payload | 异步 embedding + Qdrant upsert，失败重试 | 向量索引点位（不阻塞主链路） |
-| `Emotion/Translate/TTS` | 最终回复文本 | 情绪解析 -> 逐句翻译（每次调用返回独立 `TranslateResult`，不使用共享错误状态）-> 逐句 TTS 流式合成 | `emotion_text` + `audio_chunk` + `audio_done` |
+| `Emotion/Translate/TTS` | 最终回复文本 | 情绪解析 -> 按配置逐句翻译（`service.enable_translation`）-> 按配置逐句 TTS 流式合成（`service.enable_tts`） | `emotion_text` + （可选）`audio_chunk` + `audio_done` |
 
 ### 9.3 本示例下的关键结果
 1. 请求被识别为 `TASK`，生成“北京 3 日游”计划并执行。

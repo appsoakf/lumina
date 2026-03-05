@@ -4,6 +4,7 @@ from typing import Optional
 
 from core.config import load_app_config
 from core.llm.chat_service import ChatCompletionService
+from core.utils import log_event
 from core.utils.errors import AppError, ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,15 @@ class TranslateEngine:
                     "Translate returned empty content",
                     retryable=True,
                 )
-                logger.warning(err.message)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "translate.empty_result",
+                    err.message,
+                    component="llm",
+                    error_code=err.code.value,
+                    retryable=err.retryable,
+                )
                 return TranslateResult(text="", error=err)
             return TranslateResult(text=result)
         except Exception as exc:
@@ -60,5 +69,5 @@ class TranslateEngine:
                 f"Translate failed: {exc}",
                 retryable=True,
             )
-            logger.error(err.message)
+            logger.exception(err.message)
             return TranslateResult(text="", error=err)

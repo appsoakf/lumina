@@ -38,6 +38,8 @@ class ServiceConfig:
     username: str
     server_address: str
     server_port: int
+    enable_translation: bool
+    enable_tts: bool
 
 
 @dataclass
@@ -59,35 +61,43 @@ class MemoryVectorConfig:
 
 @dataclass
 class WebSearchConfig:
-    provider: str
-    fallback_provider: str
     timeout_sec: float
     max_top_k: int
-    duckduckgo: "DuckDuckGoConfig"
-    serpapi: "SerpApiConfig"
+    uapis: "UapiSearchConfig"
 
 
 @dataclass
-class DuckDuckGoConfig:
-    region: str
-    safesearch: str
-    backend: str
-    timelimit: str
-
-
-@dataclass
-class SerpApiConfig:
+class UapiSearchConfig:
     endpoint: str
     api_key: str
-    engine: str
-    gl: str
-    hl: str
-    tbm: str
+    default_sort: str
+    default_fetch_full: bool
 
 
 @dataclass
 class ToolsConfig:
     web_search: WebSearchConfig
+
+
+@dataclass
+class LoggingConfig:
+    level: str
+    format: str
+    log_dir: str
+    log_file_name: str
+    event_file_name: str
+    enable_console: bool
+    enable_file: bool
+    enable_event_file: bool
+    slow_threshold_ms: int
+    redact_user_text: bool
+    user_text_preview_chars: int
+
+
+@dataclass
+class TaskFlowConfig:
+    max_replan_rounds: int
+    max_clarify_rounds: int
 
 
 @dataclass
@@ -97,6 +107,8 @@ class AppConfig:
     service: ServiceConfig
     memory_vector: MemoryVectorConfig
     tools: ToolsConfig
+    logging: LoggingConfig
+    task_flow: TaskFlowConfig
 
 
 def _load_json(path: Path) -> dict:
@@ -230,6 +242,8 @@ def _build_service_config(raw: Dict[str, Any]) -> ServiceConfig:
         username=str(raw.get("username", "")).strip(),
         server_address=str(raw.get("server_address", "0.0.0.0")).strip(),
         server_port=_to_int(raw.get("server_port", 8080), "service.server_port"),
+        enable_translation=_to_bool(raw.get("enable_translation", False), "service.enable_translation"),
+        enable_tts=_to_bool(raw.get("enable_tts", False), "service.enable_tts"),
     )
     required = {
         "service.pet_name": cfg.pet_name,
@@ -316,123 +330,41 @@ def _build_memory_vector_config(raw: Dict[str, Any], llm_raw: Dict[str, Any]) ->
     return cfg
 
 
-def _build_duckduckgo_config(raw: Dict[str, Any]) -> DuckDuckGoConfig:
-    region = str(raw.get("region", "")).strip()
-    safesearch = str(raw.get("safesearch", "")).strip().lower()
-    backend = str(raw.get("backend", "")).strip().lower()
-    timelimit = str(raw.get("timelimit", "")).strip().lower()
-
-    if not region:
-        raise AppError(
-            ErrorCode.CONFIG_MISSING,
-            "Missing duckduckgo region",
-            details={"field": "tools.web_search.duckduckgo.region"},
-        )
-    if safesearch not in {"strict", "moderate", "off"}:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "Invalid duckduckgo safesearch",
-            details={
-                "field": "tools.web_search.duckduckgo.safesearch",
-                "value": safesearch,
-                "allowed": ["strict", "moderate", "off"],
-            },
-        )
-    if backend not in {"auto", "html", "lite"}:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "Invalid duckduckgo backend",
-            details={
-                "field": "tools.web_search.duckduckgo.backend",
-                "value": backend,
-                "allowed": ["auto", "html", "lite"],
-            },
-        )
-    if timelimit and timelimit not in {"d", "w", "m", "y"}:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "Invalid duckduckgo timelimit",
-            details={
-                "field": "tools.web_search.duckduckgo.timelimit",
-                "value": timelimit,
-                "allowed": ["", "d", "w", "m", "y"],
-            },
-        )
-
-    return DuckDuckGoConfig(
-        region=region,
-        safesearch=safesearch,
-        backend=backend,
-        timelimit=timelimit,
-    )
-
-
-def _build_serpapi_config(raw: Dict[str, Any]) -> SerpApiConfig:
+def _build_uapis_config(raw: Dict[str, Any]) -> UapiSearchConfig:
     endpoint = str(raw.get("endpoint", "")).strip()
     api_key = str(raw.get("api_key", "")).strip()
-    engine = str(raw.get("engine", "")).strip()
-    gl = str(raw.get("gl", "")).strip()
-    hl = str(raw.get("hl", "")).strip()
-    tbm = str(raw.get("tbm", "")).strip()
+    default_sort = str(raw.get("default_sort", "relevance")).strip().lower() or "relevance"
+    default_fetch_full = _to_bool(raw.get("default_fetch_full", False), "tools.web_search.uapis.default_fetch_full")
 
     if not endpoint:
         raise AppError(
             ErrorCode.CONFIG_MISSING,
-            "Missing serpapi endpoint",
-            details={"field": "tools.web_search.serpapi.endpoint"},
+            "Missing uapis endpoint",
+            details={"field": "tools.web_search.uapis.endpoint"},
         )
-    if not engine:
+    if default_sort not in {"relevance", "date"}:
         raise AppError(
-            ErrorCode.CONFIG_MISSING,
-            "Missing serpapi engine",
-            details={"field": "tools.web_search.serpapi.engine"},
+            ErrorCode.CONFIG_INVALID,
+            "Invalid uapis default_sort",
+            details={
+                "field": "tools.web_search.uapis.default_sort",
+                "value": default_sort,
+                "allowed": ["relevance", "date"],
+            },
         )
 
-    return SerpApiConfig(
+    return UapiSearchConfig(
         endpoint=endpoint,
         api_key=api_key,
-        engine=engine,
-        gl=gl,
-        hl=hl,
-        tbm=tbm,
+        default_sort=default_sort,
+        default_fetch_full=default_fetch_full,
     )
 
 
 def _build_web_search_config(raw: Dict[str, Any]) -> WebSearchConfig:
-    provider = str(raw.get("provider", "")).strip().lower()
-    fallback_provider = str(raw.get("fallback_provider", "")).strip().lower()
     timeout_raw = raw.get("timeout_sec")
     max_top_k_raw = raw.get("max_top_k")
 
-    if provider not in {"duckduckgo", "serpapi"}:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "Unsupported web_search provider",
-            details={
-                "field": "tools.web_search.provider",
-                "value": provider,
-                "allowed": ["duckduckgo", "serpapi"],
-            },
-        )
-    if fallback_provider not in {"none", "duckduckgo", "serpapi"}:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "Unsupported web_search fallback provider",
-            details={
-                "field": "tools.web_search.fallback_provider",
-                "value": fallback_provider,
-                "allowed": ["none", "duckduckgo", "serpapi"],
-            },
-        )
-    if fallback_provider == provider:
-        raise AppError(
-            ErrorCode.CONFIG_INVALID,
-            "web_search fallback provider must be different from primary provider",
-            details={
-                "field": "tools.web_search.fallback_provider",
-                "value": fallback_provider,
-            },
-        )
     if timeout_raw is None:
         raise AppError(
             ErrorCode.CONFIG_MISSING,
@@ -446,19 +378,12 @@ def _build_web_search_config(raw: Dict[str, Any]) -> WebSearchConfig:
             details={"field": "tools.web_search.max_top_k"},
         )
 
-    duckduckgo_raw = raw.get("duckduckgo")
-    serpapi_raw = raw.get("serpapi")
-    if not isinstance(duckduckgo_raw, dict):
+    uapis_raw = raw.get("uapis")
+    if not isinstance(uapis_raw, dict):
         raise AppError(
             ErrorCode.CONFIG_MISSING,
-            "Missing tools.web_search.duckduckgo config section",
-            details={"field": "tools.web_search.duckduckgo"},
-        )
-    if not isinstance(serpapi_raw, dict):
-        raise AppError(
-            ErrorCode.CONFIG_MISSING,
-            "Missing tools.web_search.serpapi config section",
-            details={"field": "tools.web_search.serpapi"},
+            "Missing tools.web_search.uapis config section",
+            details={"field": "tools.web_search.uapis"},
         )
 
     timeout_sec = _to_float(timeout_raw, "tools.web_search.timeout_sec")
@@ -478,12 +403,9 @@ def _build_web_search_config(raw: Dict[str, Any]) -> WebSearchConfig:
         )
 
     return WebSearchConfig(
-        provider=provider,
-        fallback_provider=fallback_provider,
         timeout_sec=timeout_sec,
         max_top_k=max_top_k,
-        duckduckgo=_build_duckduckgo_config(duckduckgo_raw),
-        serpapi=_build_serpapi_config(serpapi_raw),
+        uapis=_build_uapis_config(uapis_raw),
     )
 
 
@@ -498,6 +420,98 @@ def _build_tools_config(raw: Dict[str, Any]) -> ToolsConfig:
     return ToolsConfig(web_search=_build_web_search_config(web_search_raw))
 
 
+def _build_logging_config(raw: Dict[str, Any]) -> LoggingConfig:
+    payload = dict(raw or {})
+
+    level = str(payload.get("level", "INFO")).strip().upper() or "INFO"
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "Invalid logging level",
+            details={
+                "field": "logging.level",
+                "value": level,
+                "allowed": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            },
+        )
+
+    fmt = str(payload.get("format", "both")).strip().lower() or "both"
+    if fmt not in {"human", "json", "both"}:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "Invalid logging format mode",
+            details={
+                "field": "logging.format",
+                "value": fmt,
+                "allowed": ["human", "json", "both"],
+            },
+        )
+
+    log_dir = str(payload.get("log_dir", "logs")).strip() or "logs"
+    log_file_name = str(payload.get("log_file_name", "lumina.log")).strip() or "lumina.log"
+    event_file_name = str(payload.get("event_file_name", "events.jsonl")).strip() or "events.jsonl"
+
+    enable_console = _to_bool(payload.get("enable_console", True), "logging.enable_console")
+    enable_file = _to_bool(payload.get("enable_file", True), "logging.enable_file")
+    enable_event_file = _to_bool(payload.get("enable_event_file", True), "logging.enable_event_file")
+
+    slow_threshold_ms = _to_int(payload.get("slow_threshold_ms", 1000), "logging.slow_threshold_ms")
+    if slow_threshold_ms < 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "logging.slow_threshold_ms must be >= 0",
+            details={"field": "logging.slow_threshold_ms", "value": slow_threshold_ms},
+        )
+
+    redact_user_text = _to_bool(payload.get("redact_user_text", True), "logging.redact_user_text")
+    user_text_preview_chars = _to_int(
+        payload.get("user_text_preview_chars", 120),
+        "logging.user_text_preview_chars",
+    )
+    if user_text_preview_chars < 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "logging.user_text_preview_chars must be >= 0",
+            details={"field": "logging.user_text_preview_chars", "value": user_text_preview_chars},
+        )
+
+    return LoggingConfig(
+        level=level,
+        format=fmt,
+        log_dir=log_dir,
+        log_file_name=log_file_name,
+        event_file_name=event_file_name,
+        enable_console=enable_console,
+        enable_file=enable_file,
+        enable_event_file=enable_event_file,
+        slow_threshold_ms=slow_threshold_ms,
+        redact_user_text=redact_user_text,
+        user_text_preview_chars=user_text_preview_chars,
+    )
+
+
+def _build_task_flow_config(raw: Dict[str, Any]) -> TaskFlowConfig:
+    payload = dict(raw or {})
+    max_replan_rounds = _to_int(payload.get("max_replan_rounds", 2), "task_flow.max_replan_rounds")
+    max_clarify_rounds = _to_int(payload.get("max_clarify_rounds", 3), "task_flow.max_clarify_rounds")
+    if max_replan_rounds < 0:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "task_flow.max_replan_rounds must be >= 0",
+            details={"field": "task_flow.max_replan_rounds", "value": max_replan_rounds},
+        )
+    if max_clarify_rounds < 1:
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "task_flow.max_clarify_rounds must be >= 1",
+            details={"field": "task_flow.max_clarify_rounds", "value": max_clarify_rounds},
+        )
+    return TaskFlowConfig(
+        max_replan_rounds=max_replan_rounds,
+        max_clarify_rounds=max_clarify_rounds,
+    )
+
+
 @lru_cache(maxsize=1)
 def load_app_config() -> AppConfig:
     raw = _load_json(ROOT_CONFIG_PATH)
@@ -506,12 +520,26 @@ def load_app_config() -> AppConfig:
     tts_raw = _require_section(raw, "tts")
     service_raw = _require_section(raw, "service")
     tools_raw = _require_section(raw, "tools")
+    logging_raw = raw.get("logging") or {}
+    if not isinstance(logging_raw, dict):
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "logging must be an object",
+            details={"field": "logging"},
+        )
     memory_raw = raw.get("memory_vector") or {}
     if not isinstance(memory_raw, dict):
         raise AppError(
             ErrorCode.CONFIG_INVALID,
             "memory_vector must be an object",
             details={"field": "memory_vector"},
+        )
+    task_flow_raw = raw.get("task_flow") or {}
+    if not isinstance(task_flow_raw, dict):
+        raise AppError(
+            ErrorCode.CONFIG_INVALID,
+            "task_flow must be an object",
+            details={"field": "task_flow"},
         )
 
     return AppConfig(
@@ -520,4 +548,6 @@ def load_app_config() -> AppConfig:
         service=_build_service_config(service_raw),
         memory_vector=_build_memory_vector_config(memory_raw, llm_raw),
         tools=_build_tools_config(tools_raw),
+        logging=_build_logging_config(logging_raw),
+        task_flow=_build_task_flow_config(task_flow_raw),
     )

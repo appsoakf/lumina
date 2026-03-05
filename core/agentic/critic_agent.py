@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from core.agentic.base import BaseLLMAgent
 from core.agentic.json_mixin import JSONParseMixin
+from core.utils import log_exception
 from core.utils.errors import ErrorCode, error_payload
 from core.protocols import CriticResult, PlanResult
 
@@ -63,7 +64,13 @@ class CriticAgent(BaseLLMAgent, JSONParseMixin):
                 summary=summary,
             )
         except Exception as exc:
-            logger.warning(f"Critic fallback applied: {exc}")
+            log_exception(
+                logger,
+                "critic.review.error",
+                "Critic 执行失败，返回默认评审结果",
+                component="agent",
+                fallback="pass",
+            )
             return CriticResult(
                 quality="pass",
                 issues=[],

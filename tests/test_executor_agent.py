@@ -12,14 +12,22 @@ from core.tools import ToolResult
 from core.utils.errors import ErrorCode
 
 
-def _executor_json(status: str, summary: str = "摘要") -> str:
+def _executor_json(
+    status: str,
+    summary: str = "摘要",
+    *,
+    evidence=None,
+    details=None,
+    risks=None,
+    next_steps=None,
+) -> str:
     payload = {
         "status": status,
         "summary": summary,
-        "evidence": [],
-        "details": [],
-        "risks": [],
-        "next_steps": [],
+        "evidence": list(evidence or []),
+        "details": list(details or []),
+        "risks": list(risks or []),
+        "next_steps": list(next_steps or []),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -212,6 +220,26 @@ class ExecutorAgentReactLoopTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertIn("步骤状态: 需补充信息", result.output_text)
         self.assertIn("产出详情:", result.output_text)
+
+    def test_react_loop_coerces_success_to_need_info_when_payload_marks_missing_info(self):
+        agent = _ExecutorAgentHarness(
+            scripted_messages=[
+                _FakeMessage(
+                    content=_executor_json(
+                        "success",
+                        "用户未提供预算和位置偏好，当前信息不足以继续。",
+                        details=["缺少价格区间和就餐区域"],
+                        next_steps=["询问用户预算范围和所在位置"],
+                    )
+                )
+            ],
+        )
+
+        result = agent.run_task(user_text="test", history=[], session_id="s1")
+
+        self.assertIsNone(result.error)
+        self.assertIn("步骤状态: 需补充信息", result.output_text)
+        self.assertIn("结果摘要: 用户未提供预算和位置偏好", result.output_text)
 
 
 if __name__ == "__main__":

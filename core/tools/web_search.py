@@ -1,14 +1,16 @@
-import json
-import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import logging
+import time
+from typing import Any, Dict, List, Optional
 
 import requests
-from duckduckgo_search import DDGS
-from duckduckgo_search.exceptions import DuckDuckGoSearchException, TimeoutException as DDGTimeoutException
 
-from core.config import DuckDuckGoConfig, SerpApiConfig, WebSearchConfig, load_app_config
+from core.config import UapiSearchConfig, WebSearchConfig, load_app_config
 from core.tools.base import BaseTool
 from core.tools.models import ToolContext, ToolResult
+from core.utils import elapsed_ms, log_event
+
+
+logger = logging.getLogger(__name__)
 
 
 class WebSearchTool(BaseTool):
@@ -17,17 +19,12 @@ class WebSearchTool(BaseTool):
         *,
         config: Optional[WebSearchConfig] = None,
         session: Optional[requests.Session] = None,
-        ddgs_factory: Optional[Callable[[], Any]] = None,
     ):
         cfg = config or load_app_config().tools.web_search
-        self.primary_provider = str(cfg.provider).strip().lower()
-        self.fallback_provider = str(cfg.fallback_provider).strip().lower()
         self.max_top_k = max(int(cfg.max_top_k), 1)
         self.timeout_sec = max(float(cfg.timeout_sec), 1.0)
-        self.duckduckgo_cfg = cfg.duckduckgo
-        self.serpapi_cfg = cfg.serpapi
+        self.uapis_cfg = cfg.uapis
         self.session = session or requests.Session()
-        self.ddgs_factory = ddgs_factory or DDGS
         super().__init__(
             name="web_search",
             description="Search the web and return top relevant snippets.",
@@ -39,6 +36,10 @@ class WebSearchTool(BaseTool):
                     "language": {"type": "string", "description": "Preferred language code, e.g. zh-CN or en."},
                     "recency_days": {"type": "integer", "description": "Optional freshness hint in days."},
                     "site": {"type": "string", "description": "Optional site filter, e.g. docs.python.org."},
+                    "filetype": {"type": "string", "description": "Optional file type filter, e.g. pdf/docx."},
+                    "sort": {"type": "string", "description": "Sort mode: relevance or date."},
+                    "fetch_full": {"type": "boolean", "description": "Whether to fetch full page content."},
+                    "timeout_ms": {"type": "integer", "description": "Optional per-request timeout in ms."},
                 },
                 "required": ["text"],
             },
@@ -53,7 +54,6 @@ class WebSearchTool(BaseTool):
                 requests.Timeout,
                 requests.ConnectionError,
                 requests.HTTPError,
-                DDGTimeoutException,
             ),
         )
 
@@ -66,9 +66,13 @@ class WebSearchTool(BaseTool):
         language: str = "zh-CN",
         recency_days: Optional[int] = None,
         site: Optional[str] = None,
+        filetype: Optional[str] = None,
+        sort: Optional[str] = None,
+        fetch_full: Optional[bool] = None,
+        timeout_ms: Optional[int] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        _ = ctx, kwargs
+        _ = kwargs
         query = str(text or "").strip()
         if not query:
             return self.error_result(
@@ -78,232 +82,276 @@ class WebSearchTool(BaseTool):
             )
 
         limit = self.clamp_int(top_k, default=3, min_value=1, max_value=self.max_top_k)
-        normalized_query = self._compose_query(query=query, site=site)
-        attempts: List[Dict[str, Any]] = []
-
-        for provider in self._provider_order():
-            rows, failure = self._run_provider(
-                provider=provider,
-                query=normalized_query,
-                language=language,
-                top_k=limit,
-                recency_days=recency_days,
-            )
-            if failure is not None:
-                attempts.append(failure)
-                continue
-            if rows:
-                payload: Dict[str, Any] = {
-                    "query": query,
-                    "provider": provider,
-                    "count": len(rows),
-                    "results": rows,
-                }
-                if provider != self.primary_provider:
-                    payload["fallback_used"] = True
-                if attempts:
-                    payload["attempt_warnings"] = attempts
-                return self.ok_result(payload)
-            attempts.append(
-                {
-                    "provider": provider,
-                    "status": "empty",
-                    "message": "No relevant results",
-                }
-            )
-
-        return self._final_failure(attempts)
-
-    def _provider_order(self) -> List[str]:
-        order = [self.primary_provider]
-        fallback = self.fallback_provider
-        if fallback and fallback != "none" and fallback != self.primary_provider:
-            order.append(fallback)
-        return order
-
-    def _run_provider(
-        self,
-        *,
-        provider: str,
-        query: str,
-        language: str,
-        top_k: int,
-        recency_days: Optional[int],
-    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        try:
-            if provider == "duckduckgo":
-                return self._search_duckduckgo(query=query, top_k=top_k, recency_days=recency_days), None
-            if provider == "serpapi":
-                return self._search_serpapi(
-                    query=query,
-                    language=language,
-                    top_k=top_k,
-                    recency_days=recency_days,
-                ), None
-            return [], {
-                "provider": provider,
-                "status": "error",
-                "message": "Unsupported provider",
-            }
-        except (requests.Timeout, DDGTimeoutException) as exc:
-            return [], {
-                "provider": provider,
-                "status": "timeout",
-                "message": str(exc) or "request timeout",
-            }
-        except (requests.RequestException, DuckDuckGoSearchException, RuntimeError, ValueError) as exc:
-            return [], {
-                "provider": provider,
-                "status": "error",
-                "message": str(exc),
-            }
-
-    def _search_duckduckgo(self, *, query: str, top_k: int, recency_days: Optional[int]) -> List[Dict[str, Any]]:
-        timelimit = self._resolve_ddg_timelimit(self.duckduckgo_cfg, recency_days)
-        raw_rows = self._ddgs_text(
-            keywords=query,
-            region=self.duckduckgo_cfg.region,
-            safesearch=self.duckduckgo_cfg.safesearch,
-            timelimit=timelimit,
-            backend=self.duckduckgo_cfg.backend,
-            max_results=top_k,
+        payload = self._build_request_payload(
+            query=query,
+            limit=limit,
+            site=site,
+            filetype=filetype,
+            recency_days=recency_days,
+            sort=sort,
+            fetch_full=fetch_full,
+            timeout_ms=timeout_ms,
         )
-        rows: List[Dict[str, Any]] = []
-        for row in raw_rows:
-            if not isinstance(row, dict):
-                continue
-            title = str(row.get("title") or row.get("heading") or "").strip()
-            url = str(row.get("href") or row.get("url") or "").strip()
-            snippet = str(row.get("body") or row.get("snippet") or row.get("description") or "").strip()
-            if not title or not url:
-                continue
-            rows.append(
-                self._normalize_result(
-                    index=len(rows) + 1,
-                    title=title,
-                    url=url,
-                    snippet=snippet,
-                    source="duckduckgo",
-                    published_at=str(row.get("date") or row.get("published") or ""),
-                )
-            )
-            if len(rows) >= top_k:
-                break
-        return rows
 
-    def _ddgs_text(
-        self,
-        *,
-        keywords: str,
-        region: str,
-        safesearch: str,
-        timelimit: Optional[str],
-        backend: str,
-        max_results: int,
-    ) -> List[Dict[str, Any]]:
-        original_showwarning = warnings.showwarning
-        original_filters = list(warnings.filters)
-
-        def _showwarning(message, category, filename, lineno, file=None, line=None):
-            text = str(message)
-            is_runtime = isinstance(category, type) and issubclass(category, RuntimeWarning)
-            if is_runtime and "has been renamed to `ddgs`" in text:
-                return
-            return original_showwarning(message, category, filename, lineno, file=file, line=line)
+        started = time.perf_counter()
+        log_event(
+            logger,
+            logging.INFO,
+            "web_search.request",
+            (
+                "web_search 接收请求 "
+                f"query={query} top_k={limit} language={str(language or '').strip() or '-'} "
+                f"site={str(site or '').strip() or '-'} filetype={str(filetype or '').strip() or '-'}"
+            ),
+            component="tool",
+            session_id=str(getattr(ctx, "session_id", "") or "-"),
+            query=query,
+            top_k=limit,
+            language=str(language or "").strip() or "-",
+            recency_days=recency_days if recency_days is not None else -1,
+            site=str(site or "").strip() or "-",
+            filetype=str(filetype or "").strip() or "-",
+        )
 
         try:
-            warnings.showwarning = _showwarning
-            client = self.ddgs_factory()
-        finally:
-            warnings.showwarning = original_showwarning
-            warnings.filters[:] = original_filters
+            data = self._search_uapis(payload=payload)
+        except requests.Timeout as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "web_search.response.error",
+                "web_search 返回失败 error_code=WEB_SEARCH_TIMEOUT",
+                component="tool",
+                session_id=str(getattr(ctx, "session_id", "") or "-"),
+                error_code="WEB_SEARCH_TIMEOUT",
+                retryable=True,
+                duration_ms=elapsed_ms(started),
+                error_message=str(exc),
+            )
+            return self.error_result(
+                code="WEB_SEARCH_TIMEOUT",
+                message="web_search request timeout",
+                retryable=True,
+            )
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "web_search.response.error",
+                "web_search 返回失败 error_code=WEB_SEARCH_UPSTREAM_ERROR",
+                component="tool",
+                session_id=str(getattr(ctx, "session_id", "") or "-"),
+                error_code="WEB_SEARCH_UPSTREAM_ERROR",
+                retryable=True,
+                duration_ms=elapsed_ms(started),
+                error_message=str(exc),
+            )
+            return self.error_result(
+                code="WEB_SEARCH_UPSTREAM_ERROR",
+                message=f"web_search request failed: {exc}",
+                retryable=True,
+            )
 
-        kwargs = {
-            "keywords": keywords,
-            "region": region or None,
-            "safesearch": safesearch,
-            "timelimit": timelimit or None,
-            "backend": backend,
-            "max_results": max_results,
+        rows = self._collect_rows(data=data, top_k=limit)
+        if not rows:
+            log_event(
+                logger,
+                logging.INFO,
+                "web_search.response.empty",
+                "web_search 无结果",
+                component="tool",
+                session_id=str(getattr(ctx, "session_id", "") or "-"),
+                duration_ms=elapsed_ms(started),
+            )
+            return self.error_result(
+                code="WEB_SEARCH_EMPTY",
+                message="No relevant web results found",
+                retryable=False,
+            )
+
+        total_results = data.get("total_results")
+        if not isinstance(total_results, int):
+            total_results = len(rows)
+        sources = data.get("sources")
+        process_time_ms = data.get("process_time_ms")
+        cached = data.get("cached")
+
+        result_payload: Dict[str, Any] = {
+            "query": str(data.get("query") or query),
+            "provider": "uapis",
+            "count": len(rows),
+            "total_results": total_results,
+            "results": rows,
         }
-        if hasattr(client, "__enter__") and hasattr(client, "__exit__"):
-            with client as ddgs:
-                rows = ddgs.text(**kwargs)
-        else:
-            rows = client.text(**kwargs)
-        return list(rows or [])
+        if isinstance(sources, list):
+            result_payload["sources"] = sources
+        if isinstance(process_time_ms, int):
+            result_payload["process_time_ms"] = process_time_ms
+        if isinstance(cached, bool):
+            result_payload["cached"] = cached
 
-    def _search_serpapi(
-        self,
-        *,
-        query: str,
-        language: str,
-        top_k: int,
-        recency_days: Optional[int],
-    ) -> List[Dict[str, Any]]:
-        cfg = self.serpapi_cfg
-        if not cfg.api_key:
-            raise RuntimeError("serpapi api_key is required for fallback search")
+        titles_preview = " | ".join(
+            str(item.get("title") or "").strip()[:60]
+            for item in rows[:3]
+            if str(item.get("title") or "").strip()
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "web_search.response.success",
+            f"web_search provider 成功：uapis count={len(rows)} preview={titles_preview}",
+            component="tool",
+            session_id=str(getattr(ctx, "session_id", "") or "-"),
+            provider="uapis",
+            count=len(rows),
+            duration_ms=elapsed_ms(started),
+        )
+        return self.ok_result(result_payload)
 
-        params: Dict[str, Any] = {
-            "q": query,
-            "api_key": cfg.api_key,
-            "engine": cfg.engine,
-            "num": top_k,
-        }
-        if cfg.gl:
-            params["gl"] = cfg.gl
-        hl = self._normalize_language(language=language, fallback=cfg.hl)
-        if hl:
-            params["hl"] = hl
-        if cfg.tbm:
-            params["tbm"] = cfg.tbm
-        tbs = self._resolve_serpapi_tbs(recency_days)
-        if tbs:
-            params["tbs"] = tbs
+    def _search_uapis(self, *, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = self._build_headers(self.uapis_cfg)
+        resp = self.session.post(
+            self.uapis_cfg.endpoint,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout_sec,
+        )
 
-        resp = self.session.get(cfg.endpoint, params=params, timeout=self.timeout_sec)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(self._extract_error_message(resp))
+
         data = resp.json() if resp.content else {}
         if not isinstance(data, dict):
-            raise RuntimeError("serpapi response must be a JSON object")
-        if data.get("error"):
-            raise RuntimeError(str(data.get("error")))
+            raise RuntimeError("uapis response must be a JSON object")
 
-        rows: List[Dict[str, Any]] = []
-        rows.extend(self._collect_serpapi_rows(data.get("news_results") or [], top_k=top_k, start_index=len(rows) + 1))
-        if len(rows) < top_k:
-            rows.extend(
-                self._collect_serpapi_rows(
-                    data.get("organic_results") or [],
-                    top_k=top_k - len(rows),
-                    start_index=len(rows) + 1,
-                )
-            )
-        return rows[:top_k]
+        # 即使是 200，也可能返回业务层错误体。
+        if data.get("code") and data.get("message") and not isinstance(data.get("results"), list):
+            raise RuntimeError(f"{data.get('code')}: {data.get('message')}")
+        return data
 
-    def _collect_serpapi_rows(self, raw_rows: List[Any], *, top_k: int, start_index: int) -> List[Dict[str, Any]]:
+    def _build_headers(self, cfg: UapiSearchConfig) -> Dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if cfg.api_key:
+            # 兼容不同网关鉴权方式。
+            headers["Authorization"] = f"Bearer {cfg.api_key}"
+            headers["X-API-Key"] = cfg.api_key
+        return headers
+
+    def _extract_error_message(self, resp: requests.Response) -> str:
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+
+        if isinstance(payload, dict):
+            code = str(payload.get("code") or "").strip()
+            message = str(payload.get("message") or "").strip()
+            if code and message:
+                return f"{code}: {message}"
+            if message:
+                return message
+
+        text = str(getattr(resp, "text", "") or "").strip()
+        if text:
+            return f"HTTP {resp.status_code}: {text[:240]}"
+        return f"HTTP {resp.status_code}"
+
+    def _build_request_payload(
+        self,
+        *,
+        query: str,
+        limit: int,
+        site: Optional[str],
+        filetype: Optional[str],
+        recency_days: Optional[int],
+        sort: Optional[str],
+        fetch_full: Optional[bool],
+        timeout_ms: Optional[int],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"query": query, "limit": max(1, int(limit))}
+
+        site_text = str(site or "").strip()
+        if site_text:
+            payload["site"] = site_text
+
+        filetype_text = str(filetype or "").strip().lower()
+        if filetype_text:
+            payload["filetype"] = filetype_text
+
+        time_range = self._resolve_time_range(recency_days)
+        if time_range:
+            payload["time_range"] = time_range
+
+        sort_value = str(sort or "").strip().lower()
+        if sort_value not in {"relevance", "date"}:
+            sort_value = self.uapis_cfg.default_sort
+        payload["sort"] = sort_value
+
+        fetch_full_value = self.uapis_cfg.default_fetch_full if fetch_full is None else bool(fetch_full)
+        if fetch_full_value:
+            payload["fetch_full"] = True
+
+        payload["timeout_ms"] = self._resolve_timeout_ms(timeout_ms)
+        return payload
+
+    def _resolve_timeout_ms(self, timeout_ms: Optional[int]) -> int:
+        if timeout_ms is None:
+            value = int(self.timeout_sec * 1000)
+        else:
+            try:
+                value = int(timeout_ms)
+            except Exception:
+                value = int(self.timeout_sec * 1000)
+        return max(1000, min(value, 30000))
+
+    def _resolve_time_range(self, recency_days: Optional[int]) -> Optional[str]:
+        if recency_days is None:
+            return None
+        try:
+            days = int(recency_days)
+        except Exception:
+            return None
+        if days <= 0:
+            return None
+        if days <= 1:
+            return "day"
+        if days <= 7:
+            return "week"
+        if days <= 31:
+            return "month"
+        return "year"
+
+    def _collect_rows(self, *, data: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
+        raw_rows = data.get("results")
+        if not isinstance(raw_rows, list):
+            return []
+
         rows: List[Dict[str, Any]] = []
         for raw in raw_rows:
             if not isinstance(raw, dict):
                 continue
             title = str(raw.get("title") or "").strip()
-            url = str(raw.get("link") or "").strip()
+            url = str(raw.get("url") or "").strip()
             snippet = str(raw.get("snippet") or "").strip()
-            source = str(raw.get("source") or "serpapi").strip()
-            published_at = str(raw.get("date") or raw.get("published") or "").strip()
+            source = str(raw.get("source") or raw.get("domain") or "uapis").strip()
+            published_at = str(raw.get("publish_time") or "").strip()
             if not title or not url:
                 continue
-            rows.append(
-                self._normalize_result(
-                    index=start_index + len(rows),
-                    title=title,
-                    url=url,
-                    snippet=snippet,
-                    source=source,
-                    published_at=published_at,
-                )
+            item = self._normalize_result(
+                index=len(rows) + 1,
+                title=title,
+                url=url,
+                snippet=snippet,
+                source=source,
+                published_at=published_at,
             )
+            score = raw.get("score")
+            if isinstance(score, (int, float)):
+                item["score"] = float(score)
+            rows.append(item)
             if len(rows) >= top_k:
                 break
         return rows
@@ -323,75 +371,6 @@ class WebSearchTool(BaseTool):
             "title": str(title).strip(),
             "url": str(url).strip(),
             "snippet": str(snippet).strip(),
-            "source": str(source).strip() or "web",
+            "source": str(source).strip() or "uapis",
             "published_at": str(published_at).strip() or None,
         }
-
-    def _compose_query(self, *, query: str, site: Optional[str]) -> str:
-        output = str(query or "").strip()
-        domain = str(site or "").strip()
-        if domain:
-            output = f"site:{domain} {output}".strip()
-        return output
-
-    def _normalize_language(self, *, language: str, fallback: str) -> str:
-        text = str(language or "").strip()
-        if not text:
-            return str(fallback or "").strip().lower()
-        return text.split("-", 1)[0].strip().lower()
-
-    def _resolve_ddg_timelimit(self, cfg: DuckDuckGoConfig, recency_days: Optional[int]) -> Optional[str]:
-        if recency_days is None:
-            return cfg.timelimit or None
-        try:
-            days = int(recency_days)
-        except Exception:
-            return cfg.timelimit or None
-        if days <= 0:
-            return cfg.timelimit or None
-        if days <= 1:
-            return "d"
-        if days <= 7:
-            return "w"
-        if days <= 31:
-            return "m"
-        return "y"
-
-    def _resolve_serpapi_tbs(self, recency_days: Optional[int]) -> str:
-        if recency_days is None:
-            return ""
-        try:
-            days = int(recency_days)
-        except Exception:
-            return ""
-        if days <= 0:
-            return ""
-        if days <= 1:
-            return "qdr:d"
-        if days <= 7:
-            return "qdr:w"
-        if days <= 31:
-            return "qdr:m"
-        return "qdr:y"
-
-    def _final_failure(self, attempts: List[Dict[str, Any]]) -> ToolResult:
-        if any(item.get("status") == "timeout" for item in attempts):
-            return self.error_result(
-                code="WEB_SEARCH_TIMEOUT",
-                message="web_search request timeout",
-                retryable=True,
-                details={"attempts": attempts},
-            )
-        if any(item.get("status") == "error" for item in attempts):
-            return self.error_result(
-                code="WEB_SEARCH_UPSTREAM_ERROR",
-                message="web_search request failed",
-                retryable=True,
-                details={"attempts": attempts},
-            )
-        return self.error_result(
-            code="WEB_SEARCH_EMPTY",
-            message="No relevant web results found",
-            retryable=False,
-            details={"attempts": attempts},
-        )

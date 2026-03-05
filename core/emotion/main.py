@@ -1,6 +1,8 @@
 import json
 import logging
 
+from core.utils import log_event
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,15 @@ class EmotionEngine:
             # 找到第一个 } 的位置
             brace_end = raw.find('}')
             if brace_end == -1:
-                logger.warning(f"parse_leading_json: no closing brace found. raw={raw[:80]}")
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "emotion.parse.header_missing",
+                    "情绪JSON解析失败：未找到结束花括号",
+                    component="emotion",
+                    text_preview=str(raw or "")[:80],
+                    text_len=len(str(raw or "")),
+                )
                 return self.default_emotion, raw, self.default_intensity
             json_str = raw[:brace_end + 1]
             data = json.loads(json_str)
@@ -61,7 +71,16 @@ class EmotionEngine:
                 text = ""  # fallback: 如果没有正文，返回空字符串
             return emotion, text, intensity
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"parse_leading_json failed: {e}. raw={raw[:80]}")
+            log_event(
+                logger,
+                logging.WARNING,
+                "emotion.parse.json_error",
+                "情绪JSON解析失败：JSON格式不合法",
+                component="emotion",
+                error_message=str(e),
+                text_preview=str(raw or "")[:80],
+                text_len=len(str(raw or "")),
+            )
             return self.default_emotion, raw, self.default_intensity
 
     def get_ref_audio_intensity(self, emotion: str, intensity: str) -> str:

@@ -6,6 +6,7 @@ from typing import Dict, List
 from core.agentic.base import BaseLLMAgent
 from core.config import load_app_config
 from core.protocols import RoutingIntent
+from core.utils import log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +76,14 @@ class ChatAgent(BaseLLMAgent):
             if "chat" in decision:
                 return RoutingIntent.CHAT
             return keyword_intent
-        except Exception as exc:
-            logger.warning(f"Intent classification fallback to keyword rule: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "chat.intent.classify.error",
+                "意图识别失败，降级为关键词规则",
+                component="agent",
+                fallback="keyword_rule",
+            )
             return keyword_intent
 
     def reply_chat(self, user_text: str, history: List[Dict[str, str]]) -> str:

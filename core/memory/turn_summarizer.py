@@ -6,6 +6,7 @@ from queue import Full, Queue
 from typing import Callable, Dict, List, Optional
 
 from core.memory.ingestor import MemoryIngestor
+from core.utils import log_event, log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,14 @@ class AsyncTurnSummarizer:
             self._queue.put_nowait(dict(item))
             return True
         except Full:
-            logger.warning("Turn summary queue is full, fallback to sync extraction")
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory.turn_summary.queue_full",
+                "Turn summary 队列已满，回退同步提取",
+                component="memory",
+                queue_size=self._queue.qsize(),
+            )
             return False
 
     def summarize_now(self, item: Dict[str, object]) -> TurnSummary:
@@ -151,8 +159,13 @@ class AsyncTurnSummarizer:
                     return
                 summary = self.summarize_now(item)
                 self.on_summary(summary, item)
-            except Exception as exc:
-                logger.warning(f"Turn summary worker skipped due to error: {exc}")
+            except Exception:
+                log_exception(
+                    logger,
+                    "memory.turn_summary.worker.error",
+                    "Turn summary 异步处理失败，跳过当前条目",
+                    component="memory",
+                )
             finally:
                 self._queue.task_done()
 

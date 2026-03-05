@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from core.config import MemoryVectorConfig
+from core.utils import log_event, log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +26,29 @@ class QdrantVectorStore:
             return
 
         if QdrantClient is None or qmodels is None:
-            logger.warning("qdrant-client not installed, fallback to keyword-only retrieval")
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory.qdrant.unavailable",
+                "qdrant-client 未安装，回退到关键词检索",
+                component="memory",
+                fallback="keyword_only",
+            )
             self._ready = False
             return
 
         try:
             self.client = QdrantClient(url=cfg.qdrant_url, timeout=5.0)
             self._ensure_collection()
-        except Exception as exc:
-            logger.warning(f"Qdrant init failed, fallback to keyword-only retrieval: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.qdrant.init.error",
+                "Qdrant 初始化失败，回退到关键词检索",
+                component="memory",
+                fallback="keyword_only",
+                qdrant_url=cfg.qdrant_url,
+            )
             self.client = None
             self._ready = False
 
@@ -59,8 +74,15 @@ class QdrantVectorStore:
         if not self.is_ready() or not vector:
             return False
         if len(vector) != self.cfg.vector_dim:
-            logger.warning(
-                f"Vector dim mismatch for memory {memory_id}: got {len(vector)}, expect {self.cfg.vector_dim}"
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory.qdrant.vector_dim_mismatch",
+                "向量维度不匹配，跳过写入",
+                component="memory",
+                memory_id=memory_id,
+                vector_dim_got=len(vector),
+                vector_dim_expect=self.cfg.vector_dim,
             )
             return False
 
@@ -72,8 +94,14 @@ class QdrantVectorStore:
                 wait=False,
             )
             return True
-        except Exception as exc:
-            logger.warning(f"Qdrant upsert failed for memory {memory_id}: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.qdrant.upsert.error",
+                "Qdrant upsert 失败",
+                component="memory",
+                memory_id=memory_id,
+            )
             return False
 
     def search(
@@ -115,8 +143,14 @@ class QdrantVectorStore:
                 score = float(getattr(row, "score", 0.0))
                 hits.append({"memory_id": int(point_id), "vector_score": score, "payload": payload})
             return hits
-        except Exception as exc:
-            logger.warning(f"Qdrant search failed: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.qdrant.search.error",
+                "Qdrant 检索失败",
+                component="memory",
+                limit=limit,
+            )
             return []
 
     def delete(self, memory_ids: List[int]) -> None:
@@ -129,5 +163,11 @@ class QdrantVectorStore:
                 points_selector=qmodels.PointIdsList(points=ids),
                 wait=False,
             )
-        except Exception as exc:
-            logger.warning(f"Qdrant delete failed: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.qdrant.delete.error",
+                "Qdrant 删除失败",
+                component="memory",
+                delete_count=len(ids),
+            )

@@ -1,11 +1,13 @@
 import logging
 import threading
+import time
 from typing import Any, Dict, Optional
 
 import requests as sync_requests
 from pydantic import BaseModel
 
 from core.config import load_app_config
+from core.utils import elapsed_ms, log_event, log_exception
 from core.utils.errors import ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ class TTSEngine:
         }
 
     def synthesize_streaming(self, request: TTSRequest) -> Dict[str, Any]:
+        request_started = time.perf_counter()
         payload = self._build_payload(request)
         payload["streaming_mode"] = True
 
@@ -84,8 +87,25 @@ class TTSEngine:
                     f"TTS API error ({resp.status_code})",
                     retryable=True,
                 )
+            log_event(
+                logger,
+                logging.INFO,
+                "tts.request.done",
+                "TTS 请求建立成功",
+                component="tts",
+                status_code=int(resp.status_code),
+                duration_ms=elapsed_ms(request_started),
+            )
         except Exception as exc:
-            logger.error(f"TTS connection error: {exc}")
+            log_exception(
+                logger,
+                "tts.request.error",
+                "TTS 连接失败",
+                component="tts",
+                duration_ms=elapsed_ms(request_started),
+                error_code=ErrorCode.TTS_CONNECTION_ERROR.value,
+                retryable=True,
+            )
             return self._failure(
                 ErrorCode.TTS_CONNECTION_ERROR,
                 f"TTS connection failed: {exc}",
@@ -93,14 +113,44 @@ class TTSEngine:
             )
 
         def audio_stream():
+            stream_started = time.perf_counter()
+            first_chunk_ms: Optional[int] = None
+            chunk_count = 0
+            bytes_total = 0
             try:
                 for chunk in resp.iter_content(chunk_size=None):
                     if chunk:
+                        if first_chunk_ms is None:
+                            first_chunk_ms = elapsed_ms(stream_started)
+                        chunk_count += 1
+                        bytes_total += len(chunk)
                         yield chunk
-            except Exception as exc:
-                logger.error(f"TTS stream iteration error: {exc}")
+            except Exception:
+                log_exception(
+                    logger,
+                    "tts.stream.error",
+                    "TTS 流式读取失败",
+                    component="tts",
+                    duration_ms=elapsed_ms(stream_started),
+                    first_chunk_ms=first_chunk_ms if first_chunk_ms is not None else -1,
+                    chunk_count=chunk_count,
+                    bytes_total=bytes_total,
+                    error_code=ErrorCode.TTS_STREAM_ERROR.value,
+                    retryable=True,
+                )
             finally:
                 resp.close()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "tts.stream.end",
+                    "TTS 流式读取结束",
+                    component="tts",
+                    duration_ms=elapsed_ms(stream_started),
+                    first_chunk_ms=first_chunk_ms if first_chunk_ms is not None else -1,
+                    chunk_count=chunk_count,
+                    bytes_total=bytes_total,
+                )
 
         return {
             "success": True,

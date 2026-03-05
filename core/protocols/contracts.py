@@ -11,6 +11,7 @@ class RoutingIntent(str, Enum):
 class TaskState(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    WAITING_USER_INPUT = "waiting_user_input"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"

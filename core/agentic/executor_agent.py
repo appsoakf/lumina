@@ -6,6 +6,7 @@ from core.agentic.base import BaseLLMAgent
 from core.agentic.json_mixin import JSONParseMixin
 from core.protocols import ExecutorRunResult
 from core.tools import ToolContext, build_default_registry
+from core.utils import log_exception
 from core.utils.errors import ErrorCode, error_payload
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,42 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
             return [text] if text else []
         return []
 
+    def _looks_like_missing_information(
+        self,
+        *,
+        summary: str,
+        details: List[str],
+        next_steps: List[str],
+    ) -> bool:
+        text = "\n".join([summary, *details, *next_steps]).strip()
+        if not text:
+            return False
+
+        negative_hints = {
+            "无需补充",
+            "不需要补充",
+            "信息充足",
+            "信息完整",
+        }
+        if any(hint in text for hint in negative_hints):
+            return False
+
+        positive_hints = {
+            "信息不足",
+            "信息不完整",
+            "缺少",
+            "缺乏",
+            "未提供",
+            "需补充",
+            "需要补充",
+            "请补充",
+            "补充信息",
+            "询问用户",
+            "无法继续",
+            "无法判断",
+        }
+        return any(hint in text for hint in positive_hints)
+
     def _extract_first_line(self, text: str) -> str:
         for line in str(text or "").splitlines():
             candidate = line.strip()
@@ -173,6 +210,15 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
         details = self._to_string_list(payload.get("details"))
         risks = self._to_string_list(payload.get("risks"))
         next_steps = self._to_string_list(payload.get("next_steps"))
+
+        # 兜底纠偏：有些模型会把“缺信息”场景误标成 success。
+        # 当摘要/细节/下一步建议明显指向“需补充信息”时，统一归一到 need_info。
+        if status == self.STATUS_SUCCESS and self._looks_like_missing_information(
+            summary=summary,
+            details=details,
+            next_steps=next_steps,
+        ):
+            status = self.STATUS_NEED_INFO
 
         evidence_text = "\n".join(f"- {item}" for item in evidence) if evidence else "无"
         details_text = "\n".join(f"- {item}" for item in details) if details else "无"
@@ -289,7 +335,14 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
             # 单通道入口：始终通过统一 ReAct 循环收敛，不再分 direct-pass 与升级路径。
             return self._run_react_loop(messages=messages, ctx=ctx, tool_events=tool_events)
         except Exception as exc:
-            logger.error(f"Executor run failed: {exc}")
+            log_exception(
+                logger,
+                "executor.run.error",
+                "Executor 执行失败",
+                component="agent",
+                error_code=ErrorCode.TOOL_EXECUTION_ERROR.value,
+                retryable=True,
+            )
             return ExecutorRunResult(
                 output_text="任务执行失败。",
                 tool_events=tool_events,
@@ -299,4 +352,3 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
                     retryable=True,
                 ),
             )
-

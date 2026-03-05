@@ -1,3 +1,7 @@
+import logging
+import time
+import json
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
@@ -6,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from core.orchestrator.task_snapshot import step_result_from_node
 from core.protocols import CriticResult, ExecutorRunResult, PlanResult, TaskState
+from core.utils import elapsed_ms, log_event, log_exception
 
 
 STEP_STATE_PENDING = "pending"
@@ -16,6 +21,7 @@ STEP_STATE_FAILED = "failed"
 STEP_STATE_CANCELLED = "cancelled"
 STEP_STATE_BLOCKED = "blocked"
 STEP_STATE_SKIPPED = "skipped"
+STEP_STATE_WAITING_USER_INPUT = "waiting_user_input"
 
 TERMINAL_STATES = {
     STEP_STATE_SUCCEEDED,
@@ -33,6 +39,9 @@ UPSTREAM_FAILED_STATES = {
 ACTION_RUN_STEPS = "run_ready_steps"
 ACTION_SELECT_STEPS = "select_ready_steps"
 ACTION_REVIEW = "review_task"
+ACTION_FINALIZE = "finalize_task"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,6 +52,7 @@ class TaskFlowRunResult:
     all_tool_events: List[Dict[str, Any]]
     first_error: Optional[Dict[str, Any]]
     step_results: List[Dict[str, Any]]
+    waiting_for_input: Optional[Dict[str, Any]] = None
 
 
 class TaskFlowState(TypedDict, total=False):
@@ -61,6 +71,12 @@ class TaskFlowState(TypedDict, total=False):
     ready_batch: List[str]
     executed_steps: List[str]
     next_action: str
+    waiting_for_input: Optional[Dict[str, Any]]
+    resume_mode: bool
+    resume_plan_result: Optional[PlanResult]
+    resume_snapshot: Optional[Dict[str, Any]]
+    resume_waiting_payload: Optional[Dict[str, Any]]
+    resume_user_reply: str
 
 
 class LangGraphTaskRunner:
@@ -84,6 +100,10 @@ class LangGraphTaskRunner:
         planner_agent: Any,
         executor_agent: Any,
         critic_agent: Any,
+        resume_plan_result: Optional[PlanResult] = None,
+        resume_snapshot: Optional[Dict[str, Any]] = None,
+        resume_waiting_payload: Optional[Dict[str, Any]] = None,
+        resume_user_reply: str = "",
     ) -> TaskFlowRunResult:
         initial: TaskFlowState = {
             "user_text": user_text,
@@ -98,12 +118,24 @@ class LangGraphTaskRunner:
             "ready_batch": [],
             "executed_steps": [],
             "next_action": ACTION_SELECT_STEPS,
+            "waiting_for_input": None,
+            "resume_mode": resume_plan_result is not None and resume_snapshot is not None,
+            "resume_plan_result": resume_plan_result,
+            "resume_snapshot": resume_snapshot,
+            "resume_waiting_payload": resume_waiting_payload,
+            "resume_user_reply": resume_user_reply,
         }
 
         state = self._graph.invoke(initial)
+        critic_result = state.get("critic_result")
+        if critic_result is None:
+            if state.get("waiting_for_input"):
+                critic_result = CriticResult(quality="pass", summary="任务等待用户补充信息。")
+            else:
+                critic_result = CriticResult(quality="pass", summary="")
         return TaskFlowRunResult(
             plan_result=state["plan_result"],
-            critic_result=state["critic_result"],
+            critic_result=critic_result,
             task_snapshot=state["task_snapshot"],
             all_tool_events=list(state["all_tool_events"]),
             first_error=state.get("first_error"),
@@ -111,6 +143,7 @@ class LangGraphTaskRunner:
                 task_snapshot=state["task_snapshot"],
                 executed_steps=state.get("executed_steps") or [],
             ),
+            waiting_for_input=state.get("waiting_for_input"),
         )
 
     def _build_graph(self):
@@ -129,6 +162,7 @@ class LangGraphTaskRunner:
             {
                 ACTION_RUN_STEPS: ACTION_RUN_STEPS,
                 ACTION_REVIEW: ACTION_REVIEW,
+                ACTION_FINALIZE: ACTION_FINALIZE,
             },
         )
         graph.add_conditional_edges(
@@ -137,6 +171,7 @@ class LangGraphTaskRunner:
             {
                 ACTION_SELECT_STEPS: ACTION_SELECT_STEPS,
                 ACTION_REVIEW: ACTION_REVIEW,
+                ACTION_FINALIZE: ACTION_FINALIZE,
             },
         )
         graph.add_edge("review_task", "finalize_task")
@@ -144,43 +179,78 @@ class LangGraphTaskRunner:
         return graph.compile()
 
     def _plan_task(self, state: TaskFlowState) -> TaskFlowState:
-        planner_agent = state["planner_agent"]
-        plan_result = planner_agent.plan_task(
-            user_text=state["user_text"],
-            history=state["history"],
-        )
+        if state.get("resume_mode"):
+            plan_result = state.get("resume_plan_result")
+            snapshot = deepcopy(state.get("resume_snapshot") or {})
+            waiting_payload = dict(state.get("resume_waiting_payload") or {})
+            resume_reply = str(state.get("resume_user_reply") or "").strip()
 
-        try:
-            steps = self._build_steps(plan_result)
-            topological_order = self._build_topological_order(steps)
-            policy = self._normalize_policy(plan_result.graph_policy)
-            snapshot = {
-                "goal": plan_result.goal,
-                "policy": policy,
-                "nodes": steps,
-                "topological_order": topological_order,
-            }
-            first_error = state.get("first_error")
-        except Exception as exc:
-            snapshot = {
-                "goal": plan_result.goal,
-                "policy": self._normalize_policy(plan_result.graph_policy),
-                "nodes": [],
-                "topological_order": [],
-            }
-            first_error = state.get("first_error") or {
-                "code": "TASK_PLAN_INVALID",
-                "message": str(exc),
-                "retryable": True,
-            }
+            if plan_result is None or not isinstance(snapshot, dict) or not snapshot.get("nodes"):
+                plan_result = plan_result or PlanResult(goal=state["user_text"], steps=[], raw_text="resume_invalid")
+                snapshot = {
+                    "goal": plan_result.goal,
+                    "policy": self._normalize_policy(plan_result.graph_policy),
+                    "nodes": [],
+                    "topological_order": [],
+                }
+                first_error = {
+                    "code": "TASK_RESUME_INVALID",
+                    "message": "Task resume payload is invalid",
+                    "retryable": True,
+                }
+            else:
+                try:
+                    self._prepare_resume_snapshot(
+                        snapshot=snapshot,
+                        waiting_payload=waiting_payload,
+                        user_reply=resume_reply,
+                    )
+                    first_error = None
+                except Exception as exc:
+                    first_error = {
+                        "code": "TASK_RESUME_INVALID",
+                        "message": str(exc),
+                        "retryable": True,
+                    }
+        else:
+            planner_agent = state["planner_agent"]
+            plan_result = planner_agent.plan_task(
+                user_text=state["user_text"],
+                history=state["history"],
+            )
 
-        self._task_manager.set_plan(state["task_id"], plan_result.to_dict())
+            try:
+                steps = self._build_steps(plan_result)
+                topological_order = self._build_topological_order(steps)
+                policy = self._normalize_policy(plan_result.graph_policy)
+                snapshot = {
+                    "goal": plan_result.goal,
+                    "policy": policy,
+                    "nodes": steps,
+                    "topological_order": topological_order,
+                }
+                first_error = state.get("first_error")
+            except Exception as exc:
+                snapshot = {
+                    "goal": plan_result.goal,
+                    "policy": self._normalize_policy(plan_result.graph_policy),
+                    "nodes": [],
+                    "topological_order": [],
+                }
+                first_error = state.get("first_error") or {
+                    "code": "TASK_PLAN_INVALID",
+                    "message": str(exc),
+                    "retryable": True,
+                }
+
+            self._task_manager.set_plan(state["task_id"], plan_result.to_dict())
 
         state["plan_result"] = plan_result
         state["task_snapshot"] = snapshot
         state["first_error"] = first_error
         state["ready_batch"] = []
         state["next_action"] = ACTION_SELECT_STEPS
+        state["waiting_for_input"] = None
         return state
 
     def _select_ready_steps(self, state: TaskFlowState) -> TaskFlowState:
@@ -198,6 +268,12 @@ class LangGraphTaskRunner:
         # 4) 清空 ready_batch，路由到 review_task 做结果收敛
         if self._is_task_cancelled(task_id):
             return self._cancel_and_route_review(state=state, snapshot=snapshot)
+
+        # 已进入等待用户输入态时，本轮直接收敛到 finalize，避免继续调度。
+        if self._has_waiting_input(snapshot):
+            state["ready_batch"] = []
+            state["next_action"] = ACTION_FINALIZE
+            return state
 
         # 分支2：任务未取消，尝试刷新并挑选 ready 节点
         # _refresh_ready_nodes 会根据依赖状态把节点从 pending 转成 ready 或 blocked
@@ -290,6 +366,7 @@ class LangGraphTaskRunner:
         # - 本轮已启动的并发步骤仍会回收结果并落盘
         # - 阻断发生在本轮结束后（阻断下一轮）
         fail_fast_error: Optional[Dict[str, Any]] = None
+        waiting_payload: Optional[Dict[str, Any]] = None
         for step_id in ready_batch:
             node = self._get_node(snapshot, step_id)
             run_result = run_results.get(step_id)
@@ -308,6 +385,18 @@ class LangGraphTaskRunner:
                 self._set_first_error_once(state, run_result.error)
                 if fail_fast and fail_fast_error is None:
                     fail_fast_error = run_result.error
+            elif self._step_requires_user_input(run_result.output_text):
+                # 需补充信息不视为失败，而是挂起当前任务等待用户补充。
+                node_waiting_payload = self._build_waiting_payload(
+                    step_id=step_id,
+                    output_text=run_result.output_text,
+                )
+                node["state"] = STEP_STATE_WAITING_USER_INPUT
+                node["output_text"] = run_result.output_text
+                node["tool_events"] = list(run_result.tool_events)
+                node["error"] = None
+                if waiting_payload is None:
+                    waiting_payload = node_waiting_payload
             else:
                 # 步骤执行成功：写成功状态与输出。
                 node["state"] = STEP_STATE_SUCCEEDED
@@ -331,6 +420,9 @@ class LangGraphTaskRunner:
             self._mark_remaining_cancelled(snapshot, cancel_error)
             self._set_first_error_once(state, cancel_error)
             next_action = ACTION_REVIEW
+        elif waiting_payload is not None and state.get("first_error") is None:
+            state["waiting_for_input"] = waiting_payload
+            next_action = ACTION_FINALIZE
         elif fail_fast_error is not None:
             # fail_fast 命中后，阻断剩余未执行步骤，直接进入 review。
             self._mark_remaining_blocked(snapshot, fail_fast_error)
@@ -359,8 +451,26 @@ class LangGraphTaskRunner:
 
     def _finalize_task(self, state: TaskFlowState) -> TaskFlowState:
         task_id = state["task_id"]
+        snapshot = state["task_snapshot"]
+        self._task_manager.set_task_snapshot(task_id, snapshot)
+
         task = self._task_manager.get_task(task_id)
         if task and task.state == TaskState.CANCELLED:
+            return state
+
+        waiting_for_input = state.get("waiting_for_input")
+        if waiting_for_input:
+            waiting_error = {
+                "code": "TASK_NEED_USER_INPUT",
+                "message": str(waiting_for_input.get("summary") or "Task requires additional user input"),
+                "retryable": True,
+            }
+            self._task_manager.set_waiting_input(
+                task_id,
+                waiting_for_input=waiting_for_input,
+                task_snapshot=snapshot,
+                error=waiting_error,
+            )
             return state
 
         if state.get("first_error"):
@@ -371,7 +481,7 @@ class LangGraphTaskRunner:
 
     def _route_by_next_action(self, state: TaskFlowState) -> str:
         action = str(state.get("next_action") or ACTION_REVIEW)
-        if action in {ACTION_RUN_STEPS, ACTION_SELECT_STEPS, ACTION_REVIEW}:
+        if action in {ACTION_RUN_STEPS, ACTION_SELECT_STEPS, ACTION_REVIEW, ACTION_FINALIZE}:
             return action
         return ACTION_REVIEW
 
@@ -504,7 +614,7 @@ class LangGraphTaskRunner:
 
     def _mark_remaining_cancelled(self, snapshot: Dict[str, Any], error: Optional[Dict[str, Any]]) -> None:
         for node in snapshot["nodes"]:
-            if node.get("state") in {STEP_STATE_PENDING, STEP_STATE_READY}:
+            if node.get("state") in {STEP_STATE_PENDING, STEP_STATE_READY, STEP_STATE_WAITING_USER_INPUT}:
                 node["state"] = STEP_STATE_CANCELLED
                 node["error"] = error
 
@@ -611,15 +721,23 @@ class LangGraphTaskRunner:
         # 当前策略：一个 step 对应一个 worker，优先降低batch内等待时间。至少一个 worker
         max_workers = max(len(jobs), 1)
         results: Dict[str, ExecutorRunResult] = {}
+
+        def _invoke_step(step_input: str) -> Tuple[ExecutorRunResult, int]:
+            started = time.perf_counter()
+            result = executor_agent.run_task(
+                user_text=step_input,
+                history=history,
+                session_id=session_id,
+            )
+            return result, elapsed_ms(started)
+
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             # future -> step_id 的映射用于后续反查：
             # as_completed 返回的是 future，需要通过该映射定位所属节点。
             futures = {
                 pool.submit(
-                    executor_agent.run_task,
-                    user_text=step_input,
-                    history=history,
-                    session_id=session_id,
+                    _invoke_step,
+                    step_input,
                 ): step_id
                 for step_id, step_input in jobs
             }
@@ -630,10 +748,30 @@ class LangGraphTaskRunner:
                 step_id = futures[future]
                 try:
                     # 正常路径：收集执行器返回的结构化结果。
-                    results[step_id] = future.result()
+                    run_result, duration_ms = future.result()
+                    results[step_id] = run_result
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "task.step.run.done",
+                        f"步骤执行结束：{step_id}",
+                        component="orchestrator",
+                        step_id=step_id,
+                        duration_ms=duration_ms,
+                        ok=not bool(run_result.error),
+                    )
                 except Exception as exc:
                     # 异常路径：将异常统一包装为失败结果，避免异常向上传播
                     # 打断整批收集流程，保证其余已完成任务仍可被记录。
+                    log_exception(
+                        logger,
+                        "task.step.run.error",
+                        f"步骤执行异常：{step_id}",
+                        component="orchestrator",
+                        step_id=step_id,
+                        error_code="TOOL_EXECUTION_ERROR",
+                        retryable=True,
+                    )
                     results[step_id] = self._failed_run_result(str(exc))
         return results
 
@@ -647,6 +785,135 @@ class LangGraphTaskRunner:
                 "retryable": True,
             },
         )
+
+    def _step_requires_user_input(self, output_text: Any) -> bool:
+        text = str(output_text or "")
+        if not text:
+            return False
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not line.startswith("步骤状态"):
+                continue
+            _, _, rhs = line.replace("：", ":", 1).partition(":")
+            status_text = rhs.strip().lower()
+            return (
+                "需补充信息" in status_text
+                or "need_info" in status_text
+                or "信息不足" in status_text
+            )
+        return False
+
+    def _extract_summary_line(self, output_text: Any) -> str:
+        text = str(output_text or "")
+        if not text:
+            return ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("结果摘要"):
+                _, _, rhs = line.replace("：", ":", 1).partition(":")
+                summary = rhs.strip()
+                if summary:
+                    return summary
+        return ""
+
+    def _extract_next_steps(self, output_text: Any) -> List[str]:
+        text = str(output_text or "")
+        if not text:
+            return []
+        lines = [line.rstrip() for line in text.splitlines()]
+        capture = False
+        next_steps: List[str] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("下一步建议"):
+                capture = True
+                continue
+            if not capture:
+                continue
+            if line.startswith("关键依据") or line.startswith("产出详情") or line.startswith("限制与风险"):
+                break
+            if line.startswith("-"):
+                item = line[1:].strip()
+                if item:
+                    next_steps.append(item)
+            else:
+                next_steps.append(line)
+        return next_steps
+
+    def _extract_required_fields(self, output_text: Any) -> List[str]:
+        text = str(output_text or "")
+        candidates = {
+            "预算": "budget",
+            "价格": "budget",
+            "位置": "location",
+            "区域": "location",
+            "口味": "taste",
+            "环境": "environment",
+            "人数": "party_size",
+            "时间": "time",
+        }
+        fields: List[str] = []
+        for phrase, field in candidates.items():
+            if phrase in text and field not in fields:
+                fields.append(field)
+        return fields
+
+    def _build_waiting_payload(self, *, step_id: str, output_text: Any) -> Dict[str, Any]:
+        summary = self._extract_summary_line(output_text)
+        next_steps = self._extract_next_steps(output_text)
+        clarify_question = next_steps[0] if next_steps else "请补充继续执行该步骤所需的信息。"
+        return {
+            "pending_step_id": step_id,
+            "summary": summary or "信息不足，任务等待用户补充输入。",
+            "clarify_question": clarify_question,
+            "required_fields": self._extract_required_fields(output_text),
+            "raw_reason": str(output_text or ""),
+            "resume_count": 0,
+        }
+
+    def _prepare_resume_snapshot(
+        self,
+        *,
+        snapshot: Dict[str, Any],
+        waiting_payload: Dict[str, Any],
+        user_reply: str,
+    ) -> None:
+        pending_step_id = str(waiting_payload.get("pending_step_id") or "").strip()
+        if not pending_step_id:
+            raise ValueError("Missing pending_step_id in waiting payload")
+        node = self._get_node(snapshot, pending_step_id)
+        node["state"] = STEP_STATE_PENDING
+        node["error"] = None
+        if user_reply:
+            self._inject_user_reply_binding(node=node, user_reply=user_reply)
+
+    def _inject_user_reply_binding(self, *, node: Dict[str, Any], user_reply: str) -> None:
+        bindings = list(node.get("input_bindings") or [])
+        kept: List[Dict[str, str]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            source = str(binding.get("from") or "")
+            target = str(binding.get("to") or "")
+            if target == "user_reply" and source.startswith("$const:"):
+                continue
+            kept.append({"from": source, "to": target})
+
+        encoded = json.dumps(str(user_reply or ""), ensure_ascii=False)
+        kept.append({"from": f"$const:{encoded}", "to": "user_reply"})
+        node["input_bindings"] = kept
+
+    def _has_waiting_input(self, snapshot: Dict[str, Any]) -> bool:
+        for node in snapshot.get("nodes") or []:
+            if node.get("state") == STEP_STATE_WAITING_USER_INPUT:
+                return True
+        return False
 
     def _project_step_results(self, task_snapshot: Dict[str, Any], executed_steps: List[str]) -> List[Dict[str, Any]]:
         index = {str(node.get("step_id")): node for node in task_snapshot.get("nodes") or []}

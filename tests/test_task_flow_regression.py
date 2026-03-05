@@ -26,8 +26,9 @@ class _FakeChatAgent:
 
 
 class _FakeExecutorAgent:
-    def __init__(self, failed_steps=None):
+    def __init__(self, failed_steps=None, need_info_steps=None):
         self.failed_steps = set(failed_steps or [])
+        self.need_info_steps = set(need_info_steps or [])
         self.calls = []
 
     def run_task(self, user_text, history, session_id):
@@ -42,6 +43,18 @@ class _FakeExecutorAgent:
                 output_text=f"{step_id} failed",
                 tool_events=[],
                 error={"code": "STEP_FAILED", "message": step_id, "retryable": True},
+            )
+        if step_id in self.need_info_steps:
+            return ExecutorRunResult(
+                output_text=(
+                    "步骤状态: 需补充信息\n"
+                    "结果摘要: 用户未提供足够约束，无法继续该步骤。\n"
+                    "关键依据:\n无\n"
+                    "产出详情:\n- 当前缺少必要输入。\n"
+                    "限制与风险:\n- 下游步骤输入将为空。\n"
+                    "下一步建议:\n- 询问用户补充预算与位置偏好"
+                ),
+                tool_events=[],
             )
         return ExecutorRunResult(output_text=f"{step_id} ok", tool_events=[])
 
@@ -215,6 +228,33 @@ class TaskFlowRegressionTests(unittest.TestCase):
         self.assertEqual(result.meta.get("task_id"), task.task_id)
         self.assertEqual(manager.get_task(task.task_id).state, TaskState.CANCELLED)
 
+    def test_task_shortcut_cancel_waiting_task(self):
+        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
+        manager = TaskManager(store=store)
+        chat_agent = _FakeChatAgent()
+
+        task = manager.create_task(session_id="s1", user_text="waiting")
+        manager.set_state(task.task_id, TaskState.RUNNING)
+        manager.set_waiting_input(
+            task.task_id,
+            waiting_for_input={"pending_step_id": "S1", "clarify_question": "请补充预算"},
+            task_snapshot={"nodes": []},
+            error={"code": "TASK_NEED_USER_INPUT", "message": "need input", "retryable": True},
+        )
+
+        result = execute_task_shortcut(
+            user_text="/cancel",
+            session_id="s1",
+            history=[],
+            task_manager=manager,
+            chat_agent=chat_agent,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.meta.get("task_command"), "cancel")
+        self.assertEqual(result.meta.get("task_id"), task.task_id)
+        self.assertEqual(manager.get_task(task.task_id).state, TaskState.CANCELLED)
+
     def test_task_shortcut_retry_latest_retryable_task(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
         manager = TaskManager(store=store)
@@ -313,6 +353,106 @@ class TaskFlowRegressionTests(unittest.TestCase):
         self.assertEqual(state_map["S3"], "succeeded")
         self.assertIsNotNone(result.first_error)
         self.assertEqual(len(result.step_results), 3)
+
+    def test_langgraph_runner_need_info_blocks_downstream_steps_under_fail_fast(self):
+        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
+        manager = TaskManager(store=store)
+        task = manager.create_task(session_id="s1", user_text="demo")
+        manager.set_state(task.task_id, TaskState.RUNNING)
+
+        plan = PlanResult(
+            goal="demo",
+            steps=[
+                PlanItem(step_id="S1", title="collect", instruction="collect input"),
+                PlanItem(step_id="S2", title="search", instruction="search", depends_on=["S1"]),
+            ],
+            graph_policy={"max_parallelism": 1, "fail_fast": True},
+        )
+        runner = LangGraphTaskRunner(
+            task_manager=manager,
+            build_step_input=lambda **kwargs: f"当前步骤: {kwargs['step_id']}",
+        )
+        executor_agent = _FakeExecutorAgent(need_info_steps={"S1"})
+
+        result = runner.run(
+            user_text="demo",
+            history=[],
+            session_id="s1",
+            task_id=task.task_id,
+            planner_agent=_FakePlannerAgent(plan),
+            executor_agent=executor_agent,
+            critic_agent=_FakeCriticAgent(),
+        )
+
+        state_map = {item["step_id"]: item["state"] for item in result.task_snapshot["nodes"]}
+        self.assertEqual(executor_agent.calls, ["S1"])
+        self.assertEqual(state_map["S1"], "waiting_user_input")
+        self.assertEqual(state_map["S2"], "pending")
+        self.assertIsNone(result.first_error)
+        self.assertIsNotNone(result.waiting_for_input)
+        self.assertEqual(result.waiting_for_input.get("pending_step_id"), "S1")
+        self.assertEqual(manager.get_task(task.task_id).state, TaskState.WAITING_USER_INPUT)
+
+    def test_langgraph_runner_can_resume_waiting_task_with_same_task_id(self):
+        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
+        manager = TaskManager(store=store)
+        task = manager.create_task(session_id="s1", user_text="demo")
+        manager.set_state(task.task_id, TaskState.RUNNING)
+
+        plan = PlanResult(
+            goal="demo",
+            steps=[
+                PlanItem(step_id="S1", title="collect", instruction="collect input"),
+                PlanItem(step_id="S2", title="search", instruction="search", depends_on=["S1"]),
+            ],
+            graph_policy={"max_parallelism": 1, "fail_fast": True},
+        )
+        runner = LangGraphTaskRunner(
+            task_manager=manager,
+            build_step_input=lambda **kwargs: f"当前步骤: {kwargs['step_id']}",
+        )
+
+        first = runner.run(
+            user_text="demo",
+            history=[],
+            session_id="s1",
+            task_id=task.task_id,
+            planner_agent=_FakePlannerAgent(plan),
+            executor_agent=_FakeExecutorAgent(need_info_steps={"S1"}),
+            critic_agent=_FakeCriticAgent(),
+        )
+        self.assertIsNotNone(first.waiting_for_input)
+        persisted = manager.get_task(task.task_id)
+        self.assertEqual(persisted.state, TaskState.WAITING_USER_INPUT)
+
+        resumed_task, resumed_ok, waiting_payload = manager.resume_waiting_task(task.task_id, "预算200，东城区")
+        self.assertTrue(resumed_ok)
+        self.assertIsNotNone(resumed_task)
+        self.assertIsNotNone(waiting_payload)
+        self.assertEqual(resumed_task.state, TaskState.RUNNING)
+
+        second_executor = _FakeExecutorAgent()
+        second = runner.run(
+            user_text="demo",
+            history=[],
+            session_id="s1",
+            task_id=task.task_id,
+            planner_agent=_FakePlannerAgent(plan),
+            executor_agent=second_executor,
+            critic_agent=_FakeCriticAgent(),
+            resume_plan_result=plan,
+            resume_snapshot=manager.get_task(task.task_id).task_snapshot,
+            resume_waiting_payload=waiting_payload,
+            resume_user_reply="预算200，东城区",
+        )
+
+        state_map = {item["step_id"]: item["state"] for item in second.task_snapshot["nodes"]}
+        self.assertEqual(state_map["S1"], "succeeded")
+        self.assertEqual(state_map["S2"], "succeeded")
+        self.assertIsNone(second.waiting_for_input)
+        self.assertIsNone(second.first_error)
+        self.assertEqual(second_executor.calls, ["S1", "S2"])
+        self.assertEqual(manager.get_task(task.task_id).state, TaskState.SUCCEEDED)
 
     def test_langgraph_runner_executes_ready_batch_in_parallel(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))

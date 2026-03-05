@@ -107,6 +107,71 @@ class _ExecutorStub:
         return ExecutorRunResult(output_text=f"{step_id} ok", tool_events=[])
 
 
+class _NeedInfoThenSuccessExecutor:
+    def __init__(self):
+        self.calls = []
+        self.need_info_emitted = False
+
+    def run_task(self, user_text, history, session_id):
+        _ = history, session_id
+        step_id = _extract_step_id(user_text)
+        self.calls.append(step_id)
+        if step_id == "S1" and not self.need_info_emitted:
+            self.need_info_emitted = True
+            return ExecutorRunResult(
+                output_text=(
+                    "步骤状态: 需补充信息\n"
+                    "结果摘要: 缺少用户预算和区域偏好。\n"
+                    "关键依据:\n无\n"
+                    "产出详情:\n- 缺少关键约束。\n"
+                    "限制与风险:\n- 无法继续筛选。\n"
+                    "下一步建议:\n- 请补充预算和所在区域"
+                ),
+                tool_events=[],
+            )
+        return ExecutorRunResult(output_text=f"{step_id} ok", tool_events=[])
+
+
+class _FailThenSuccessExecutor:
+    def __init__(self):
+        self.failed_once = False
+        self.calls = []
+
+    def run_task(self, user_text, history, session_id):
+        _ = history, session_id
+        step_id = _extract_step_id(user_text)
+        self.calls.append(step_id)
+        if not self.failed_once:
+            self.failed_once = True
+            return ExecutorRunResult(
+                output_text=f"{step_id} failed once",
+                tool_events=[],
+                error={"code": "STEP_FAILED", "message": "temporary", "retryable": True},
+            )
+        return ExecutorRunResult(output_text=f"{step_id} ok", tool_events=[])
+
+
+class _AlwaysNeedInfoExecutor:
+    def __init__(self):
+        self.calls = []
+
+    def run_task(self, user_text, history, session_id):
+        _ = history, session_id
+        step_id = _extract_step_id(user_text)
+        self.calls.append(step_id)
+        return ExecutorRunResult(
+            output_text=(
+                "步骤状态: 需补充信息\n"
+                "结果摘要: 仍缺少关键偏好信息。\n"
+                "关键依据:\n无\n"
+                "产出详情:\n- 需要更多约束。\n"
+                "限制与风险:\n- 无法继续。\n"
+                "下一步建议:\n- 请补充预算和区域"
+            ),
+            tool_events=[],
+        )
+
+
 class _CancelOnFirstExecutor:
     def __init__(self, manager: TaskManager):
         self._manager = manager
@@ -247,6 +312,81 @@ class OrchestratorLangGraphTests(unittest.TestCase):
 
         orchestrator.close()
         self.assertEqual(memory.closed, 1)
+
+    def test_waiting_task_resume_flow_uses_same_task_id(self):
+        plan = PlanResult(
+            goal="demo",
+            steps=[
+                PlanItem(step_id="S1", title="collect", instruction="collect input"),
+                PlanItem(step_id="S2", title="search", instruction="search", depends_on=["S1"]),
+            ],
+            graph_policy={"max_parallelism": 1, "fail_fast": True},
+        )
+        executor = _NeedInfoThenSuccessExecutor()
+        orchestrator, manager = self._build_orchestrator(plan, executor)
+
+        first = orchestrator.handle_user_message(
+            user_text="请推荐北京烤鸭",
+            session_id="s1",
+        )
+        task_id = str(first.meta.get("task_id"))
+        self.assertTrue(first.meta.get("task_waiting_input"))
+        self.assertEqual(int(first.meta.get("task_round_count") or 0), 1)
+        self.assertEqual(manager.get_task(task_id).state, TaskState.WAITING_USER_INPUT)
+        self.assertEqual(first.meta.get("task_waiting_step_id"), "S1")
+
+        second = orchestrator.handle_user_message(
+            user_text="预算200，东城区，环境安静",
+            session_id="s1",
+        )
+        self.assertEqual(str(second.meta.get("task_id")), task_id)
+        self.assertFalse(bool(second.meta.get("task_waiting_input")))
+        self.assertEqual(int(second.meta.get("task_round_count") or 0), 2)
+        self.assertEqual(manager.get_task(task_id).state, TaskState.SUCCEEDED)
+        self.assertIn("S1", executor.calls)
+        self.assertIn("S2", executor.calls)
+
+    def test_orchestrator_replans_retryable_failure_and_converges(self):
+        plan = PlanResult(
+            goal="demo",
+            steps=[PlanItem(step_id="S1", title="only", instruction="do once")],
+            graph_policy={"max_parallelism": 1, "fail_fast": True},
+        )
+        executor = _FailThenSuccessExecutor()
+        orchestrator, manager = self._build_orchestrator(plan, executor)
+
+        result = orchestrator.handle_user_message(
+            user_text="请执行任务",
+            session_id="s1",
+        )
+
+        task_id = str(result.meta.get("task_id"))
+        self.assertEqual(manager.get_task(task_id).state, TaskState.SUCCEEDED)
+        self.assertFalse(bool(result.meta.get("task_waiting_input")))
+        self.assertEqual(int(result.meta.get("task_replan_count") or 0), 1)
+        self.assertGreaterEqual(len(executor.calls), 2)
+
+    def test_orchestrator_marks_not_converged_when_clarify_rounds_exceeded(self):
+        plan = PlanResult(
+            goal="demo",
+            steps=[PlanItem(step_id="S1", title="collect", instruction="collect input")],
+            graph_policy={"max_parallelism": 1, "fail_fast": True},
+        )
+        executor = _AlwaysNeedInfoExecutor()
+        orchestrator, manager = self._build_orchestrator(plan, executor)
+        orchestrator._max_clarify_rounds = 1
+
+        result = orchestrator.handle_user_message(
+            user_text="请执行任务",
+            session_id="s1",
+        )
+
+        task_id = str(result.meta.get("task_id"))
+        task = manager.get_task(task_id)
+        self.assertEqual(task.state, TaskState.FAILED)
+        self.assertFalse(bool(result.meta.get("task_waiting_input")))
+        self.assertIsNotNone(result.executor_result.error)
+        self.assertEqual(result.executor_result.error.get("code"), "TASK_NOT_CONVERGED")
 
 
 if __name__ == "__main__":

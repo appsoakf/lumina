@@ -15,6 +15,7 @@ from core.memory.short_term_store import ShortTermMemoryStore
 from core.memory.store import LongTermMemoryStore
 from core.memory.turn_summarizer import AsyncTurnSummarizer, TurnSummary, TurnSummaryExtractor
 from core.memory.vector_store import QdrantVectorStore
+from core.utils import log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +221,13 @@ class MemoryService:
                 topic=summary.topic,
                 meta=meta,
             )
-        except Exception as exc:
-            logger.warning(f"Turn summary persist skipped due to error: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.turn_summary.persist.error",
+                "Turn summary 落盘失败，已跳过本次写入",
+                component="memory",
+            )
 
     def _persist_profile_candidates(
         self,
@@ -350,9 +356,19 @@ class MemoryService:
     def close(self) -> None:
         try:
             self.turn_summarizer.close()
-        except Exception as exc:
-            logger.warning(f"Turn summarizer close failed: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.turn_summary.close.error",
+                "Turn summary 关闭失败",
+                component="memory",
+            )
         try:
             self.vector_indexer.close()
-        except Exception as exc:
-            logger.warning(f"Memory vector indexer close failed: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.vector_indexer.close.error",
+                "向量索引器关闭失败",
+                component="memory",
+            )

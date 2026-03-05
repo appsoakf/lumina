@@ -18,6 +18,9 @@ class TaskRecord:
     plan: Optional[Dict[str, Any]] = None
     step_results: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[Dict[str, Any]] = None
+    task_snapshot: Optional[Dict[str, Any]] = None
+    waiting_for_input: Optional[Dict[str, Any]] = None
+    convergence: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -33,6 +36,9 @@ class TaskRecord:
             "plan": self.plan,
             "step_results": self.step_results,
             "error": self.error,
+            "task_snapshot": self.task_snapshot,
+            "waiting_for_input": self.waiting_for_input,
+            "convergence": self.convergence,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -47,6 +53,9 @@ class TaskRecord:
             plan=data.get("plan"),
             step_results=data.get("step_results", []),
             error=data.get("error"),
+            task_snapshot=data.get("task_snapshot"),
+            waiting_for_input=data.get("waiting_for_input"),
+            convergence=data.get("convergence") or {},
             created_at=data.get("created_at", utc_now()),
             updated_at=data.get("updated_at", utc_now()),
         )

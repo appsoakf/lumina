@@ -1,18 +1,28 @@
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.agentic.chat_agent import ChatAgent
 from core.agentic.critic_agent import CriticAgent
 from core.agentic.executor_agent import ExecutorAgent
 from core.agentic.planner_agent import PlannerAgent
 from core.capabilities import CapabilityRegistry, build_default_registry
+from core.config import load_app_config
 from core.memory import MemoryService
 from core.orchestrator.langgraph_task_runner import LangGraphTaskRunner
 from core.orchestrator.task_snapshot import completed_context, resolve_step_inputs
 from core.orchestrator.task_shortcuts import execute_task_shortcut
-from core.protocols import CriticResult, ExecutorRunResult, OrchestrationResult, RoutingIntent, TaskState
+from core.protocols import (
+    CriticResult,
+    ExecutorRunResult,
+    OrchestrationResult,
+    PlanItem,
+    PlanResult,
+    RoutingIntent,
+    TaskState,
+)
 from core.tasks import TaskManager
+from core.utils import log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +53,9 @@ class Orchestrator:
             task_manager=self._task_manager,
             build_step_input=self._build_step_task_input,
         )
+        task_flow_cfg = load_app_config().task_flow
+        self._max_replan_rounds = max(int(task_flow_cfg.max_replan_rounds), 0)
+        self._max_clarify_rounds = max(int(task_flow_cfg.max_clarify_rounds), 1)
 
     def _resolve_agent(self, capability: str):
         agent_name = self.capabilities.resolve_agent(capability)
@@ -72,8 +85,14 @@ class Orchestrator:
                 assistant_reply=final_reply,
                 meta=meta,
             )
-        except Exception as exc:
-            logger.warning(f"Memory ingest skipped due to error: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "orchestrator.memory.ingest.error",
+                "记忆写入失败，本轮已跳过写入",
+                component="orchestrator",
+                fallback="skip_memory_ingest",
+            )
 
     def record_session_round(
         self,
@@ -118,6 +137,10 @@ class Orchestrator:
         history: List[Dict[str, str]],
         session_id: str,
         task_id: str,
+        resume_plan_result: Optional[PlanResult] = None,
+        resume_snapshot: Optional[Dict[str, Any]] = None,
+        resume_waiting_payload: Optional[Dict[str, Any]] = None,
+        resume_user_reply: str = "",
     ):
         _, planner_agent = self._resolve_agent("task_planning")
         _, executor_agent = self._resolve_agent("task_execution")
@@ -130,6 +153,10 @@ class Orchestrator:
             planner_agent=planner_agent,
             executor_agent=executor_agent,
             critic_agent=critic_agent,
+            resume_plan_result=resume_plan_result,
+            resume_snapshot=resume_snapshot,
+            resume_waiting_payload=resume_waiting_payload,
+            resume_user_reply=resume_user_reply,
         )
 
     def _extract_step_summary(self, output_text: object) -> str:
@@ -160,6 +187,177 @@ class Orchestrator:
             return line
         return ""
 
+    def _plan_result_from_dict(self, payload: Dict[str, Any], user_text: str) -> PlanResult:
+        raw_steps = payload.get("steps") or []
+        steps: List[PlanItem] = []
+        for idx, item in enumerate(raw_steps, start=1):
+            if not isinstance(item, dict):
+                continue
+            step_id = str(item.get("step_id") or f"S{idx}").strip() or f"S{idx}"
+            title = str(item.get("title") or f"步骤{idx}").strip() or f"步骤{idx}"
+            instruction = str(item.get("instruction") or title).strip() or title
+            depends_on = [str(dep).strip() for dep in (item.get("depends_on") or []) if str(dep).strip()]
+            bindings: List[Dict[str, Any]] = []
+            for binding in item.get("input_bindings") or []:
+                if not isinstance(binding, dict):
+                    continue
+                source = str(binding.get("from") or "").strip()
+                target = str(binding.get("to") or "").strip()
+                if not source or not target:
+                    continue
+                bindings.append({"from": source, "to": target})
+            steps.append(
+                PlanItem(
+                    step_id=step_id,
+                    title=title,
+                    instruction=instruction,
+                    depends_on=depends_on,
+                    input_bindings=bindings,
+                )
+            )
+        return PlanResult(
+            goal=str(payload.get("goal") or user_text).strip() or user_text,
+            steps=steps,
+            raw_text=str(payload.get("raw_text") or ""),
+            error=payload.get("error") if isinstance(payload.get("error"), dict) else None,
+            graph_policy=payload.get("graph_policy") if isinstance(payload.get("graph_policy"), dict) else {},
+        )
+
+    def _compose_waiting_executor_output(self, task_snapshot: Dict[str, Any], waiting_for_input: Dict[str, Any]) -> str:
+        question = str(waiting_for_input.get("clarify_question") or "").strip()
+        required_fields = [str(v).strip() for v in (waiting_for_input.get("required_fields") or []) if str(v).strip()]
+        summary = str(waiting_for_input.get("summary") or "当前任务需要补充信息。").strip()
+
+        lines = [
+            f"任务目标: {task_snapshot.get('goal', '')}",
+            "",
+            "当前状态: 等待补充信息",
+            f"说明: {summary}",
+        ]
+        if question:
+            lines.append(f"请补充: {question}")
+        if required_fields:
+            lines.append(f"建议补充字段: {', '.join(required_fields)}")
+        return "\n".join(lines)
+
+    def _task_not_converged_error(self, *, reason: str) -> Dict[str, Any]:
+        return {
+            "code": "TASK_NOT_CONVERGED",
+            "message": reason,
+            "retryable": True,
+        }
+
+    def _should_replan(self, task_run: Any) -> bool:
+        if task_run.waiting_for_input:
+            return False
+        if task_run.first_error:
+            error = task_run.first_error or {}
+            if str(error.get("code") or "").strip() == "TASK_CANCELLED":
+                return False
+            retryable = bool(error.get("retryable", True))
+            return retryable
+        return False
+
+    def _compose_replan_user_text(self, *, original_user_text: str, task_run: Any, round_index: int) -> str:
+        lines = [
+            original_user_text,
+            "",
+            f"[重试轮次 {round_index}] 请根据上一轮执行结果修正计划并继续完成任务。",
+        ]
+        if task_run.first_error:
+            err = task_run.first_error
+            lines.append(f"上轮错误: {err.get('code', '')} {err.get('message', '')}".strip())
+
+        critic = task_run.critic_result
+        if critic and critic.suggestions:
+            lines.append("评审建议:")
+            for item in critic.suggestions[:4]:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"- {text}")
+
+        return "\n".join(lines).strip()
+
+    def _mark_not_converged_if_needed(
+        self,
+        *,
+        task_id: str,
+        task_run: Any,
+        round_count: int,
+    ) -> Any:
+        if not task_run.waiting_for_input:
+            return task_run
+        if round_count < self._max_clarify_rounds:
+            return task_run
+
+        reason = f"Clarification rounds exceeded max_clarify_rounds={self._max_clarify_rounds}"
+        error = self._task_not_converged_error(reason=reason)
+        for node in task_run.task_snapshot.get("nodes") or []:
+            if str(node.get("state")) == "waiting_user_input":
+                node["state"] = "failed"
+                node["error"] = error
+        task_run.waiting_for_input = None
+        task_run.first_error = error
+        task_run.critic_result = CriticResult(quality="revise", summary="任务多轮追问后仍未收敛。")
+        self._task_manager.set_task_snapshot(task_id, task_run.task_snapshot)
+        self._task_manager.set_state(task_id, TaskState.FAILED, error=error)
+        return task_run
+
+    def _run_with_convergence_loop(
+        self,
+        *,
+        user_text: str,
+        history: List[Dict[str, str]],
+        session_id: str,
+        task_id: str,
+        resume_plan_result: Optional[PlanResult] = None,
+        resume_snapshot: Optional[Dict[str, Any]] = None,
+        resume_waiting_payload: Optional[Dict[str, Any]] = None,
+        resume_user_reply: str = "",
+    ) -> tuple[Any, int]:
+        replan_used = 0
+        current_user_text = user_text
+        use_resume = resume_plan_result is not None and resume_snapshot is not None
+        current_plan = resume_plan_result
+        current_snapshot = resume_snapshot
+        current_waiting_payload = resume_waiting_payload
+        current_resume_reply = resume_user_reply
+
+        while True:
+            task_run = self._run_task_mode(
+                user_text=current_user_text,
+                history=history,
+                session_id=session_id,
+                task_id=task_id,
+                resume_plan_result=current_plan if use_resume else None,
+                resume_snapshot=current_snapshot if use_resume else None,
+                resume_waiting_payload=current_waiting_payload if use_resume else None,
+                resume_user_reply=current_resume_reply if use_resume else "",
+            )
+            use_resume = False
+            current_plan = None
+            current_snapshot = None
+            current_waiting_payload = None
+            current_resume_reply = ""
+
+            if not self._should_replan(task_run):
+                return task_run, replan_used
+            if replan_used >= self._max_replan_rounds:
+                reason = f"Replan rounds exceeded max_replan_rounds={self._max_replan_rounds}"
+                error = self._task_not_converged_error(reason=reason)
+                task_run.first_error = error
+                self._task_manager.set_state(task_id, TaskState.FAILED, error=error)
+                return task_run, replan_used
+
+            replan_used += 1
+            self._task_manager.retry_task(task_id)
+            self._task_manager.set_state(task_id, TaskState.RUNNING)
+            current_user_text = self._compose_replan_user_text(
+                original_user_text=user_text,
+                task_run=task_run,
+                round_index=replan_used,
+            )
+
     def _compose_general_executor_output(self, task_snapshot: Dict[str, object], critic: CriticResult) -> str:
         lines = [f"任务目标: {task_snapshot.get('goal', '')}", "", "执行进展:"]
         for node in task_snapshot.get("nodes") or []:
@@ -173,6 +371,7 @@ class Orchestrator:
                 "blocked": "阻塞",
                 "cancelled": "已取消",
                 "skipped": "跳过",
+                "waiting_user_input": "等待补充信息",
             }.get(state_value, state_value)
 
             step_title = str(node.get("title") or "").strip() or str(node.get("step_id") or "步骤")
@@ -210,6 +409,66 @@ class Orchestrator:
             chat_agent=chat_agent,
         )
 
+    def _build_task_orchestration_result(
+        self,
+        *,
+        user_text: str,
+        history: List[Dict[str, str]],
+        task_id: str,
+        task_run: Any,
+        round_count: int,
+        replan_count: int,
+    ) -> OrchestrationResult:
+        _, chat_agent = self._resolve_agent("chat")
+
+        if task_run.waiting_for_input:
+            executor_output = self._compose_waiting_executor_output(
+                task_snapshot=task_run.task_snapshot,
+                waiting_for_input=task_run.waiting_for_input,
+            )
+        else:
+            executor_output = self._compose_general_executor_output(
+                task_snapshot=task_run.task_snapshot,
+                critic=task_run.critic_result,
+            )
+
+        executor_result = ExecutorRunResult(
+            output_text=executor_output,
+            tool_events=task_run.all_tool_events,
+            error=task_run.first_error,
+            step_results=task_run.step_results,
+        )
+
+        final_reply = chat_agent.reply_with_task_result(
+            user_text=user_text,
+            executor_output=executor_result.output_text,
+            history=history,
+        )
+
+        waiting_payload = task_run.waiting_for_input or {}
+        meta = {
+            "task_id": task_id,
+            "agent_chain": ["chat_agent", "planner_agent", "executor_agent", "critic_agent", "chat_agent"],
+            "task_mode": True,
+            "plan": task_run.plan_result.to_dict(),
+            "task_graph": task_run.task_snapshot,
+            "critic": task_run.critic_result.to_dict(),
+            "task_error": bool(task_run.first_error),
+            "task_waiting_input": bool(task_run.waiting_for_input),
+            "task_waiting_step_id": waiting_payload.get("pending_step_id"),
+            "task_clarify_question": waiting_payload.get("clarify_question"),
+            "task_required_fields": list(waiting_payload.get("required_fields") or []),
+            "task_round_count": int(round_count),
+            "task_replan_count": int(replan_count),
+        }
+
+        return OrchestrationResult(
+            intent=RoutingIntent.TASK,
+            final_reply=final_reply,
+            executor_result=executor_result,
+            meta=meta,
+        )
+
     def handle_user_message(
         self,
         user_text: str,
@@ -228,6 +487,56 @@ class Orchestrator:
             return shortcut_result
 
         enriched_history = self._augment_history_with_memory(history=history, query=user_text)
+
+        # waiting task resume: 优先把本轮输入作为补充信息，继续已有任务
+        waiting_task = self._task_manager.get_waiting_task(session_id=session_id)
+        if waiting_task is not None:
+            resumed_task, resumed, waiting_payload = self._task_manager.resume_waiting_task(
+                waiting_task.task_id,
+                user_reply=user_text,
+            )
+            if resumed and resumed_task is not None:
+                plan_payload = resumed_task.plan if isinstance(resumed_task.plan, dict) else {}
+                plan_result = self._plan_result_from_dict(plan_payload, user_text=resumed_task.user_text)
+                snapshot = resumed_task.task_snapshot if isinstance(resumed_task.task_snapshot, dict) else {}
+                prev_round_count = int((resumed_task.convergence or {}).get("round_count", 0))
+                prev_replan_count = int((resumed_task.convergence or {}).get("replan_count", 0))
+                round_count = prev_round_count + 1
+
+                task_run, replan_used = self._run_with_convergence_loop(
+                    user_text=resumed_task.user_text,
+                    history=enriched_history,
+                    session_id=session_id,
+                    task_id=resumed_task.task_id,
+                    resume_plan_result=plan_result,
+                    resume_snapshot=snapshot,
+                    resume_waiting_payload=waiting_payload,
+                    resume_user_reply=user_text,
+                )
+                task_run = self._mark_not_converged_if_needed(
+                    task_id=resumed_task.task_id,
+                    task_run=task_run,
+                    round_count=round_count,
+                )
+                total_replan_count = prev_replan_count + int(replan_used)
+                self._task_manager.update_convergence(
+                    resumed_task.task_id,
+                    {
+                        "round_count": round_count,
+                        "replan_count": total_replan_count,
+                        "last_progress_score": 1 if not task_run.waiting_for_input else 0,
+                    },
+                )
+                result = self._build_task_orchestration_result(
+                    user_text=user_text,
+                    history=enriched_history,
+                    task_id=resumed_task.task_id,
+                    task_run=task_run,
+                    round_count=round_count,
+                    replan_count=total_replan_count,
+                )
+                self._record_memory(session_id, user_text, result.final_reply, result.meta)
+                return result
 
         # 意图识别
         _, chat_agent = self._resolve_agent("chat")
@@ -248,49 +557,37 @@ class Orchestrator:
         task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
         task_id = task.task_id
         self._task_manager.set_state(task_id, TaskState.RUNNING)
-
-        task_run = self._run_task_mode(
+        round_count = 1
+        task_run, replan_used = self._run_with_convergence_loop(
             user_text=user_text,
             history=enriched_history,
             session_id=session_id,
             task_id=task_id,
         )
-
-        executor_output = self._compose_general_executor_output(
-            task_snapshot=task_run.task_snapshot,
-            critic=task_run.critic_result,
+        task_run = self._mark_not_converged_if_needed(
+            task_id=task_id,
+            task_run=task_run,
+            round_count=round_count,
         )
-
-        executor_result = ExecutorRunResult(
-            output_text=executor_output,
-            tool_events=task_run.all_tool_events,
-            error=task_run.first_error,
-            step_results=task_run.step_results,
+        total_replan_count = int(replan_used)
+        self._task_manager.update_convergence(
+            task_id,
+            {
+                "round_count": round_count,
+                "replan_count": total_replan_count,
+                "last_progress_score": 1 if not task_run.waiting_for_input else 0,
+            },
         )
-
-        final_reply = chat_agent.reply_with_task_result(
+        result = self._build_task_orchestration_result(
             user_text=user_text,
-            executor_output=executor_result.output_text,
             history=enriched_history,
+            task_id=task_id,
+            task_run=task_run,
+            round_count=round_count,
+            replan_count=total_replan_count,
         )
-
-        meta = {
-            "task_id": task_id,
-            "agent_chain": ["chat_agent", "planner_agent", "executor_agent", "critic_agent", "chat_agent"],
-            "task_mode": True,
-            "plan": task_run.plan_result.to_dict(),
-            "task_graph": task_run.task_snapshot,
-            "critic": task_run.critic_result.to_dict(),
-            "task_error": bool(task_run.first_error),
-        }
-
-        self._record_memory(session_id, user_text, final_reply, meta)
-        return OrchestrationResult(
-            intent=RoutingIntent.TASK,
-            final_reply=final_reply,
-            executor_result=executor_result,
-            meta=meta,
-        )
+        self._record_memory(session_id, user_text, result.final_reply, result.meta)
+        return result
 
     def close(self) -> None:
         close_fn = getattr(self._memory, "close", None)

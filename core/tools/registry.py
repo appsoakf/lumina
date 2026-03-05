@@ -1,3 +1,4 @@
+import json
 from typing import Any, Dict, List
 
 from core.tools.base import BaseTool
@@ -17,6 +18,10 @@ class ToolRegistry:
     def call(self, name: str, args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         tool = self._tools.get(str(name or "").strip())
         if tool is None:
-            return ToolResult(ok=False, content=f"Unknown tool: {name}")
+            payload = {
+                "error_code": "TOOL_NOT_FOUND",
+                "message": f"Unknown tool: {name}",
+                "retryable": False,
+            }
+            return ToolResult(ok=False, content=json.dumps(payload, ensure_ascii=False))
         return tool.invoke(args=args, ctx=ctx)
-

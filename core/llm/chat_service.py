@@ -1,8 +1,13 @@
+import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from core.config import load_app_config
 from core.llm.client import create_openai_client
+from core.utils import elapsed_ms, log_event, log_exception
 from core.utils.errors import AppError, ErrorCode
+
+logger = logging.getLogger(__name__)
 
 
 class ChatCompletionService:
@@ -72,6 +77,7 @@ class ChatCompletionService:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
     ):
+        started = time.perf_counter()
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -82,7 +88,40 @@ class ChatCompletionService:
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
-        return self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            usage = getattr(response, "usage", None)
+            fields: Dict[str, Any] = {
+                "component": "llm",
+                "model": self.model,
+                "duration_ms": elapsed_ms(started),
+                "stream": False,
+            }
+            if usage is not None:
+                fields["prompt_tokens"] = int(getattr(usage, "prompt_tokens", 0) or 0)
+                fields["completion_tokens"] = int(getattr(usage, "completion_tokens", 0) or 0)
+                fields["total_tokens"] = int(getattr(usage, "total_tokens", 0) or 0)
+            log_event(
+                logger,
+                logging.INFO,
+                "llm.invoke.done",
+                "LLM 同步调用完成",
+                **fields,
+            )
+            return response
+        except Exception:
+            log_exception(
+                logger,
+                "llm.invoke.error",
+                "LLM 同步调用失败",
+                component="llm",
+                model=self.model,
+                duration_ms=elapsed_ms(started),
+                stream=False,
+                error_code=ErrorCode.LLM_API_ERROR.value,
+                retryable=True,
+            )
+            raise
 
     def invoke_stream(
         self,
@@ -92,6 +131,7 @@ class ChatCompletionService:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
     ):
+        started = time.perf_counter()
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -102,4 +142,29 @@ class ChatCompletionService:
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
-        return self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            log_event(
+                logger,
+                logging.INFO,
+                "llm.stream.open",
+                "LLM 流式调用建立成功",
+                component="llm",
+                model=self.model,
+                duration_ms=elapsed_ms(started),
+                stream=True,
+            )
+            return response
+        except Exception:
+            log_exception(
+                logger,
+                "llm.stream.error",
+                "LLM 流式调用失败",
+                component="llm",
+                model=self.model,
+                duration_ms=elapsed_ms(started),
+                stream=True,
+                error_code=ErrorCode.LLM_STREAM_ERROR.value,
+                retryable=True,
+            )
+            raise

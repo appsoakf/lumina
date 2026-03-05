@@ -1,12 +1,13 @@
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from core.protocols import TaskState
 from core.tasks.record import TaskRecord
 from core.tasks.store import TaskStore
+from core.utils import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,13 @@ class TaskManager:
 
     _ALLOWED_TRANSITIONS = {
         TaskState.PENDING: {TaskState.RUNNING, TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED},
-        TaskState.RUNNING: {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED},
+        TaskState.RUNNING: {
+            TaskState.WAITING_USER_INPUT,
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
+            TaskState.CANCELLED,
+        },
+        TaskState.WAITING_USER_INPUT: {TaskState.RUNNING, TaskState.FAILED, TaskState.CANCELLED},
         TaskState.SUCCEEDED: set(),
         TaskState.FAILED: {TaskState.PENDING},
         TaskState.CANCELLED: {TaskState.PENDING},
@@ -106,10 +113,17 @@ class TaskManager:
 
     def _select_current_task_locked(self, session_id: str) -> Optional[TaskRecord]:
         tasks = self._list_session_tasks_locked(session_id=session_id, limit=50)
-        for state in (TaskState.RUNNING, TaskState.PENDING):
+        for state in (TaskState.RUNNING, TaskState.PENDING, TaskState.WAITING_USER_INPUT):
             for task in tasks:
                 if task.state == state:
                     return task
+        return None
+
+    def _select_waiting_task_locked(self, session_id: str) -> Optional[TaskRecord]:
+        tasks = self._list_session_tasks_locked(session_id=session_id, limit=50)
+        for task in tasks:
+            if task.state == TaskState.WAITING_USER_INPUT:
+                return task
         return None
 
     def _select_latest_retryable_task_locked(self, session_id: str) -> Optional[TaskRecord]:
@@ -136,6 +150,9 @@ class TaskManager:
         task.state = TaskState.PENDING
         task.error = None
         task.step_results = []
+        task.waiting_for_input = None
+        task.task_snapshot = None
+        task.convergence = {}
         task.touch()
         self._mark_mutated(task.task_id)
         self.store.save(task)
@@ -159,8 +176,82 @@ class TaskManager:
             self._mark_mutated(task_id)
             self.store.save(task)
 
+    def set_task_snapshot(self, task_id: str, task_snapshot: Dict[str, Any]) -> None:
+        with self._lock:
+            task = self._get_task_locked(task_id)
+            if not task:
+                return
+            task.task_snapshot = dict(task_snapshot or {})
+            task.touch()
+            self._mark_mutated(task_id)
+            self.store.save(task)
 
-    
+    def set_waiting_input(
+        self,
+        task_id: str,
+        *,
+        waiting_for_input: Dict[str, Any],
+        task_snapshot: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        with self._lock:
+            task = self._get_task_locked(task_id)
+            if not task:
+                return False
+            if not self._can_transition(task.state, TaskState.WAITING_USER_INPUT):
+                return False
+            task.state = TaskState.WAITING_USER_INPUT
+            task.error = error
+            task.waiting_for_input = dict(waiting_for_input or {})
+            if task_snapshot is not None:
+                task.task_snapshot = dict(task_snapshot)
+            task.touch()
+            self._mark_mutated(task_id)
+            self.store.save(task)
+            return True
+
+    def update_convergence(self, task_id: str, patch: Dict[str, Any]) -> None:
+        with self._lock:
+            task = self._get_task_locked(task_id)
+            if not task:
+                return
+            payload = dict(task.convergence or {})
+            payload.update(dict(patch or {}))
+            task.convergence = payload
+            task.touch()
+            self._mark_mutated(task_id)
+            self.store.save(task)
+
+    def get_waiting_task(self, session_id: str) -> Optional[TaskRecord]:
+        with self._lock:
+            return self._select_waiting_task_locked(session_id=session_id)
+
+    def resume_waiting_task(self, task_id: str, user_reply: str) -> Tuple[Optional[TaskRecord], bool, Optional[Dict[str, Any]]]:
+        with self._lock:
+            task = self._get_task_locked(task_id)
+            if not task:
+                return None, False, None
+            if task.state != TaskState.WAITING_USER_INPUT:
+                return task, False, None
+
+            waiting_payload = dict(task.waiting_for_input or {})
+            text = str(user_reply or "").strip()
+            if text:
+                waiting_payload["latest_user_reply"] = text
+                replies = list(waiting_payload.get("user_replies") or [])
+                replies.append(text)
+                waiting_payload["user_replies"] = replies
+
+            if not self._can_transition(task.state, TaskState.RUNNING):
+                return task, False, None
+            task.state = TaskState.RUNNING
+            task.error = None
+            task.waiting_for_input = None
+            task.touch()
+            self._mark_mutated(task_id)
+            self.store.save(task)
+            return task, True, waiting_payload
+
     def set_state(self, task_id: str, state: TaskState, error: Dict = None) -> bool:
         """
         设置 task的state和error信息。
@@ -174,11 +265,15 @@ class TaskManager:
             if not task:
                 return False
             if not self._can_transition(task.state, state):
-                logger.warning(
-                    "Rejected task state transition: task_id=%s from=%s to=%s",
-                    task_id,
-                    task.state.value,
-                    state.value,
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "task.state.transition.rejected",
+                    "拒绝非法任务状态迁移",
+                    component="task",
+                    task_id=task_id,
+                    from_state=task.state.value,
+                    to_state=state.value,
                 )
                 return False
             task.state = state

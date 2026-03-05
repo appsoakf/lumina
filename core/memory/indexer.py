@@ -6,6 +6,7 @@ from typing import Dict, Optional
 
 from core.memory.embedding import EmbeddingProvider
 from core.memory.vector_store import QdrantVectorStore
+from core.utils import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,15 @@ class MemoryVectorIndexer:
         try:
             self._queue.put_nowait(item)
         except Full:
-            logger.warning("Memory vector queue is full, drop index request")
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory.vector.queue.drop",
+                "向量索引队列已满，丢弃写入请求",
+                component="memory",
+                memory_id=int(memory_id),
+                queue_size=self._queue.qsize(),
+            )
 
     def _run(self) -> None:
         while True:
@@ -86,7 +95,16 @@ class MemoryVectorIndexer:
         try:
             self._queue.put_nowait(item)
         except Full:
-            logger.warning("Memory vector queue is full, drop retried index request")
+            log_event(
+                logger,
+                logging.WARNING,
+                "memory.vector.queue.retry_drop",
+                "向量索引重试队列已满，丢弃重试请求",
+                component="memory",
+                memory_id=memory_id,
+                attempt=int(item.get("attempt", 0)),
+                queue_size=self._queue.qsize(),
+            )
 
     def flush(self, timeout: Optional[float] = None) -> bool:
         if not self._enabled:

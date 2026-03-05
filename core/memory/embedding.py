@@ -3,6 +3,7 @@ from typing import Any, List, Optional
 
 from core.config import MemoryVectorConfig
 from core.llm.client import create_openai_client
+from core.utils import log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,14 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
         try:
             self.client = create_openai_client(api_key=cfg.embedding_api_key, base_url=cfg.embedding_api_url)
-        except Exception as exc:
-            logger.warning(f"Embedding provider init failed, fallback to keyword-only retrieval: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.embedding.init.error",
+                "Embedding 初始化失败，回退到关键词检索",
+                component="memory",
+                fallback="keyword_only",
+            )
             self._ready = False
 
     def is_ready(self) -> bool:
@@ -49,6 +56,13 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             if not isinstance(vector, list) or not vector:
                 return None
             return [float(x) for x in vector]
-        except Exception as exc:
-            logger.warning(f"Embedding request failed: {exc}")
+        except Exception:
+            log_exception(
+                logger,
+                "memory.embedding.request.error",
+                "Embedding 请求失败",
+                component="memory",
+                model=self.cfg.embedding_model,
+                text_len=len(payload),
+            )
             return None

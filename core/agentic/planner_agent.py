@@ -3,6 +3,7 @@ from typing import Dict, List
 
 from core.agentic.base import BaseLLMAgent
 from core.agentic.json_mixin import JSONParseMixin
+from core.utils import log_exception
 from core.utils.errors import ErrorCode, error_payload
 from core.protocols import PlanItem, PlanResult
 
@@ -200,7 +201,13 @@ class PlannerAgent(BaseLLMAgent, JSONParseMixin):
 
             return PlanResult(goal=goal, steps=steps, raw_text=raw, graph_policy=graph_policy)
         except Exception as e:
-            logger.warning(f"Planner fallback applied: {e}")
+            log_exception(
+                logger,
+                "planner.plan.error",
+                "Planner 执行失败，使用兜底计划",
+                component="agent",
+                fallback="default_plan",
+            )
             fallback = self._fallback_plan(user_text)
             fallback.error = error_payload(
                 code=ErrorCode.INTERNAL_ERROR,
