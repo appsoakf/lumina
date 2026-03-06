@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class PlannerAgent(BaseLLMAgent, JSONParseMixin):
     """Planner agent: decomposes user request into executable steps."""
 
-    def __init__(self, max_steps: int = 6):
+    def __init__(self, max_steps: int = 5):
         super().__init__(
             missing_key_message="Missing LLM API key for planner agent",
             missing_key_field="chat_api_key",
@@ -32,28 +32,22 @@ class PlannerAgent(BaseLLMAgent, JSONParseMixin):
         steps = [
             PlanItem(
                 step_id="S1",
-                title="明确目标与约束",
-                instruction=f"提炼用户任务目标与限制条件：{user_text}",
+                title="明确目标与关键约束",
+                instruction=f"提炼用户任务目标、必要约束与可执行范围：{user_text}",
                 depends_on=[],
             ),
             PlanItem(
                 step_id="S2",
-                title="生成可执行方案",
-                instruction="给出结构化方案（步骤、时间、资源、风险）。",
+                title="交付可执行结果",
+                instruction="基于约束直接给出可执行方案与最终清单，包含关键风险与下一步建议。",
                 depends_on=["S1"],
-            ),
-            PlanItem(
-                step_id="S3",
-                title="输出最终清单",
-                instruction="整理为用户可直接执行的清单与建议。",
-                depends_on=["S2"],
             ),
         ]
         return PlanResult(
             goal=user_text,
             steps=steps,
             raw_text="fallback_plan",
-            graph_policy={"max_parallelism": 1, "fail_fast": True},
+            graph_policy={"max_parallelism": 2, "fail_fast": True},
         )
 
     def plan_task(self, user_text: str, history: List[Dict[str, str]]) -> PlanResult:
@@ -70,7 +64,7 @@ class PlannerAgent(BaseLLMAgent, JSONParseMixin):
 {
   "goal": "string",
   "graph_policy": {
-    "max_parallelism": 1,
+    "max_parallelism": 2,
     "fail_fast": true
   },
   "steps": [
@@ -90,11 +84,11 @@ class PlannerAgent(BaseLLMAgent, JSONParseMixin):
 - 简洁复述用户最终目标，不要改写用户核心意图。
 
 2. graph_policy
-- max_parallelism: 正整数，建议 1-3。
+- max_parallelism: 正整数，建议 1-2。
 - fail_fast: 布尔值。默认 true；当步骤相互独立且允许部分完成时可设为 false。
 
 3. steps
-- 步骤数必须为 2-6。
+- 步骤数必须为 2-5。
 - 每个步骤必须包含 title 和 instruction。
 - title: 简洁、可读，描述该步骤目标。
 - instruction: 必须具体可执行，写清动作与产出。
@@ -111,6 +105,8 @@ class PlannerAgent(BaseLLMAgent, JSONParseMixin):
 2. 步骤要可验证：执行后能判断完成/失败。
 3. 依赖要最小化：仅在确有数据或顺序依赖时设置 depends_on。
 4. 如果用户信息不足，第一步应先“澄清假设/提取约束”，后续步骤基于该结果继续。
+5. 禁止把“搜索 -> 筛选 -> 输出”拆成多个纯文本改写步骤；若能一次产出结果，必须合并为同一步。
+6. 优先给出短链路计划，默认 2 步，最多 5 步。
 
 【输出示例】
 {

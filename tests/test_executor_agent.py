@@ -71,20 +71,24 @@ class _FakeResponse:
 
 
 class _FakeToolRegistry:
-    def __init__(self):
+    def __init__(self, tool_names=None):
         self.calls = []
+        self._tool_names = list(tool_names or ["get_current_time"])
 
     def list_schemas(self):
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_current_time",
-                    "description": "fake tool",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            }
-        ]
+        schemas = []
+        for tool_name in self._tool_names:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": str(tool_name),
+                        "description": "fake tool",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                    },
+                }
+            )
+        return schemas
 
     def call(self, name, args, ctx):
         self.calls.append(
@@ -102,12 +106,13 @@ class _ExecutorAgentHarness(ExecutorAgent):
         self,
         *,
         scripted_messages,
+        tool_names=None,
         max_tool_rounds=4,
         max_repeated_tool_call=2,
     ):
         self.max_tool_rounds = max_tool_rounds
         self.max_repeated_tool_call = max_repeated_tool_call
-        self.registry = _FakeToolRegistry()
+        self.registry = _FakeToolRegistry(tool_names=tool_names)
         self._scripted_messages = list(scripted_messages)
         self.invocations = []
 
@@ -136,6 +141,7 @@ class ExecutorAgentPromptTests(unittest.TestCase):
         self.assertIn("仅输出一个 JSON 对象", prompt)
         self.assertIn("\"status\": \"success|failed|need_info\"", prompt)
         self.assertIn("【工具调用规则】", prompt)
+        self.assertIn("涉及文件读取或写入时，必须先调用对应文件工具", prompt)
         self.assertIn("不输出情绪字段或情绪 JSON", prompt)
 
 
@@ -240,6 +246,71 @@ class ExecutorAgentReactLoopTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertIn("步骤状态: 需补充信息", result.output_text)
         self.assertIn("结果摘要: 用户未提供预算和位置偏好", result.output_text)
+
+    def test_react_loop_requires_file_tool_evidence_before_marking_success(self):
+        agent = _ExecutorAgentHarness(
+            scripted_messages=[_FakeMessage(content=_executor_json("success", "已写入文件"))],
+            tool_names=["write_markdown", "read_file", "read_pdf"],
+        )
+
+        result = agent.run_task(
+            user_text="请将内容写入 D:\\test_file.md",
+            history=[],
+            session_id="s1",
+        )
+
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.get("code"), ErrorCode.TOOL_EXECUTION_ERROR.value)
+        self.assertIn("未获取到有效的工具执行记录", result.output_text)
+        self.assertEqual(len(result.tool_events), 0)
+        self.assertEqual(
+            agent.invocations[0].get("tool_choice"),
+            {"type": "function", "function": {"name": "write_markdown"}},
+        )
+
+    def test_react_loop_forces_read_file_before_final_answer(self):
+        agent = _ExecutorAgentHarness(
+            scripted_messages=[
+                _FakeMessage(
+                    tool_calls=[
+                        _FakeToolCall("c1", "read_file", '{"path":"D:\\\\test_file.md"}'),
+                    ]
+                ),
+                _FakeMessage(content=_executor_json("success", "已读取文件内容")),
+            ],
+            tool_names=["read_file", "read_pdf"],
+        )
+
+        result = agent.run_task(
+            user_text="请读取 D:\\test_file.md 的内容",
+            history=[],
+            session_id="s1",
+        )
+
+        self.assertIsNone(result.error)
+        self.assertIn("步骤状态: 成功", result.output_text)
+        self.assertEqual(len(result.tool_events), 1)
+        self.assertEqual(result.tool_events[0]["tool"], "read_file")
+        self.assertEqual(
+            agent.invocations[0].get("tool_choice"),
+            {"type": "function", "function": {"name": "read_file"}},
+        )
+
+    def test_react_loop_returns_error_when_required_file_tool_missing(self):
+        agent = _ExecutorAgentHarness(
+            scripted_messages=[],
+            tool_names=["get_current_time"],
+        )
+
+        result = agent.run_task(
+            user_text="请将内容写入 D:\\test_file.md",
+            history=[],
+            session_id="s1",
+        )
+
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.get("code"), ErrorCode.TOOL_EXECUTION_ERROR.value)
+        self.assertIn("缺少可用工具", result.output_text)
 
 
 if __name__ == "__main__":

@@ -425,5 +425,37 @@ class TaskFlowRegressionTests(unittest.TestCase):
         # S1/S2 should run in the same batch; if auto-serialized, elapsed would be notably longer.
         self.assertLess(elapsed, 0.55)
 
+    def test_langgraph_runner_caps_max_parallelism_to_two(self):
+        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
+        manager = TaskManager(store=store)
+        task = manager.create_task(session_id="s1", user_text="demo")
+        manager.set_state(task.task_id, TaskState.RUNNING)
+
+        plan = PlanResult(
+            goal="demo",
+            steps=[
+                PlanItem(step_id="S1", title="s1", instruction="do s1"),
+                PlanItem(step_id="S2", title="s2", instruction="do s2"),
+                PlanItem(step_id="S3", title="s3", instruction="do s3"),
+            ],
+            graph_policy={"max_parallelism": 5, "fail_fast": False},
+        )
+        runner = LangGraphTaskRunner(
+            task_manager=manager,
+            build_step_input=lambda **kwargs: f"当前步骤: {kwargs['step_id']}",
+        )
+
+        result = runner.run(
+            user_text="demo",
+            history=[],
+            session_id="s1",
+            task_id=task.task_id,
+            planner_agent=_FakePlannerAgent(plan),
+            executor_agent=_FakeExecutorAgent(),
+            critic_agent=_FakeCriticAgent(),
+        )
+
+        self.assertEqual(result.task_snapshot["policy"].get("max_parallelism"), 2)
+
 if __name__ == "__main__":
     unittest.main()

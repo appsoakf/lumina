@@ -1,12 +1,14 @@
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import re
+import time
+from typing import Any, Dict, List, Optional, Set
 
 from core.agentic.base import BaseLLMAgent
 from core.agentic.json_mixin import JSONParseMixin
 from core.protocols import ExecutorRunResult
 from core.tools import ToolContext, build_default_registry
-from core.utils import log_exception
+from core.utils import elapsed_ms, log_event, log_exception
 from core.utils.errors import ErrorCode, error_payload
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,7 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
     STATUS_SUCCESS = "成功"
     STATUS_FAILED = "失败"
     STATUS_NEED_INFO = "需补充信息"
+    _FILE_EXT_PATTERN = re.compile(r"\.(pdf|md|txt|json|ya?ml|csv|log|py)\b", re.IGNORECASE)
 
     def __init__(self, max_tool_rounds: int = 4, max_repeated_tool_call: int = 2):
         super().__init__(
@@ -53,6 +56,7 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
 1. 若现有信息足够，避免不必要的工具调用。
 2. 工具参数要最小化且精确，避免宽泛查询。
 3. 工具失败时，明确失败原因、是否可重试、建议补充信息。
+4. 涉及文件读取或写入时，必须先调用对应文件工具（read_file/read_pdf/write_markdown），未调用工具不得宣称已完成。
 
 【最终输出规则（必须严格遵守）】
 1. 仅输出一个 JSON 对象，不输出其他文字，不使用 markdown 代码块。
@@ -117,6 +121,86 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
     def _tool_call_signature(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         encoded_args = json.dumps(tool_args, ensure_ascii=False, sort_keys=True)
         return f"{tool_name}|{encoded_args}"
+
+    def _latest_user_message(self, messages: List[Dict[str, Any]]) -> str:
+        for msg in reversed(messages):
+            if str(msg.get("role") or "") == "user":
+                return str(msg.get("content") or "")
+        return ""
+
+    def _infer_required_file_tool(self, user_message: str) -> Optional[str]:
+        text = str(user_message or "")
+        if not text:
+            return None
+        lowered = text.lower()
+        ext_match = self._FILE_EXT_PATTERN.search(lowered)
+        ext = str(ext_match.group(1) or "").lower() if ext_match else ""
+
+        write_hints = (
+            "写入",
+            "写到",
+            "保存",
+            "落盘",
+            "覆盖",
+            "追加",
+            "write",
+            "save",
+            "append",
+        )
+        read_hints = (
+            "读取",
+            "读出",
+            "查看",
+            "打开",
+            "读取内容",
+            "read",
+            "open file",
+        )
+        is_write = any(hint in lowered for hint in write_hints)
+        is_read = any(hint in lowered for hint in read_hints)
+        if is_write:
+            if ext == "md" or "markdown" in lowered:
+                return "write_markdown"
+            return None
+        if is_read:
+            if ext == "pdf":
+                return "read_pdf"
+            if ext in {"md", "txt", "json", "yaml", "yml", "csv", "log", "py"}:
+                return "read_file"
+            if "文件" in text or "file" in lowered:
+                return "read_file"
+        return None
+
+    def _available_tool_names(self, tool_schemas: List[Dict[str, Any]]) -> Set[str]:
+        names: Set[str] = set()
+        for schema in tool_schemas:
+            if not isinstance(schema, dict):
+                continue
+            function = schema.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "").strip()
+            if name:
+                names.add(name)
+        return names
+
+    def _required_tool_satisfied(self, required_tool_name: Optional[str], tool_events: List[Dict[str, Any]]) -> bool:
+        if not required_tool_name:
+            return True
+        for event in tool_events:
+            if str(event.get("tool") or "") == required_tool_name and bool(event.get("ok")):
+                return True
+        return False
+
+    def _missing_required_file_tool_output(self, required_tool_name: str) -> str:
+        return (
+            f"步骤状态: {self.STATUS_FAILED}\n"
+            "结果摘要: 当前步骤涉及文件操作，但未获取到有效的工具执行记录，无法确认操作已完成。\n"
+            f"关键依据:\n- 预期工具: {required_tool_name}\n"
+            "产出详情:\n- 模型返回了文本结论，但没有对应的成功工具调用事件。\n"
+            "限制与风险:\n- 若继续按成功处理，可能出现“声称已写入/已读取但实际未执行”的假成功。\n"
+            "下一步建议:\n- 重新执行该步骤，并确保先完成对应工具调用后再给出结论"
+        )
 
     def _normalize_status(self, raw_status: Any) -> str:
         text = str(raw_status or "").strip().lower()
@@ -240,6 +324,34 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
             return self._fallback_render_text(raw_text)
         return self._render_final_text(payload, raw_text=raw_text)
 
+    def _log_step_perf(
+        self,
+        *,
+        ok: bool,
+        rounds: int,
+        llm_calls: int,
+        llm_ms: int,
+        tool_calls: int,
+        tool_ms: int,
+        duration_ms: int,
+        status: str,
+    ) -> None:
+        log_event(
+            logger,
+            logging.INFO,
+            "executor.step.done",
+            "Executor 步骤执行完成",
+            component="agent",
+            ok=ok,
+            status=status,
+            rounds=rounds,
+            llm_calls=llm_calls,
+            llm_ms=llm_ms,
+            tool_calls=tool_calls,
+            tool_ms=tool_ms,
+            duration_ms=duration_ms,
+        )
+
     def _run_react_loop(
         self,
         *,
@@ -250,16 +362,53 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
         # 记录“工具名+参数”签名出现次数，避免模型陷入重复调用死循环。
         repeated_call_counter: Dict[str, int] = {}
         tool_schemas = self.registry.list_schemas()
+        available_tool_names = self._available_tool_names(tool_schemas)
+        required_tool_name = self._infer_required_file_tool(self._latest_user_message(messages))
+        if required_tool_name and required_tool_name not in available_tool_names:
+            self._log_step_perf(
+                ok=False,
+                rounds=0,
+                llm_calls=0,
+                llm_ms=0,
+                tool_calls=0,
+                tool_ms=0,
+                duration_ms=0,
+                status="missing_required_tool",
+            )
+            return ExecutorRunResult(
+                output_text=f"当前步骤涉及文件操作，但缺少可用工具：{required_tool_name}。",
+                tool_events=tool_events,
+                error=error_payload(
+                    code=ErrorCode.TOOL_EXECUTION_ERROR,
+                    message=f"Missing required tool for file operation: {required_tool_name}",
+                    retryable=True,
+                ),
+            )
+        step_started = time.perf_counter()
+        rounds_used = 0
+        llm_calls = 0
+        llm_ms_total = 0
+        tool_calls_total = 0
+        tool_ms_total = 0
 
         # ReAct 状态机：
         # DECIDE(模型决策) -> ACT(执行工具) -> OBSERVE(回填工具结果) -> DECIDE ...
-        for _ in range(self.max_tool_rounds):
+        for round_index in range(1, self.max_tool_rounds + 1):
+            rounds_used = round_index
+            llm_started = time.perf_counter()
+            required_tool_satisfied = self._required_tool_satisfied(required_tool_name, tool_events)
+            tool_choice: Any = "auto"
+            if required_tool_name and not required_tool_satisfied:
+                tool_choice = {"type": "function", "function": {"name": required_tool_name}}
             resp = self.invoke_chat(
                 messages=messages,
                 tools=tool_schemas,
-                tool_choice="auto",
+                tool_choice=tool_choice,
                 temperature=0.2,
             )
+            llm_duration_ms = elapsed_ms(llm_started)
+            llm_calls += 1
+            llm_ms_total += llm_duration_ms
             msg = resp.choices[0].message
             tool_calls = list(getattr(msg, "tool_calls", None) or [])
 
@@ -278,6 +427,16 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
                     signature = self._tool_call_signature(tool_name, tool_args)
                     repeated_call_counter[signature] = repeated_call_counter.get(signature, 0) + 1
                     if repeated_call_counter[signature] > self.max_repeated_tool_call:
+                        self._log_step_perf(
+                            ok=False,
+                            rounds=rounds_used,
+                            llm_calls=llm_calls,
+                            llm_ms=llm_ms_total,
+                            tool_calls=tool_calls_total,
+                            tool_ms=tool_ms_total,
+                            duration_ms=elapsed_ms(step_started),
+                            status="loop_detected",
+                        )
                         return ExecutorRunResult(
                             output_text="任务执行陷入重复工具调用，请用户补充更具体约束。",
                             tool_events=tool_events,
@@ -288,7 +447,11 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
                             ),
                         )
 
+                    tool_started = time.perf_counter()
                     result = self.registry.call(tool_name, tool_args, ctx)
+                    tool_duration_ms = elapsed_ms(tool_started)
+                    tool_calls_total += 1
+                    tool_ms_total += tool_duration_ms
                     event = {
                         "tool": tool_name,
                         "args": tool_args,
@@ -308,9 +471,52 @@ class ExecutorAgent(BaseLLMAgent, JSONParseMixin):
             # 没有 tool_calls 时，若模型给出文本则作为最终可交付结果并统一规范化。
             text = (msg.content or "").strip()
             if text:
+                required_tool_satisfied = self._required_tool_satisfied(required_tool_name, tool_events)
+                payload = self._parse_final_payload(text)
+                parsed_status = self._normalize_status(payload.get("status")) if payload else self.STATUS_NEED_INFO
+                if required_tool_name and parsed_status == self.STATUS_SUCCESS and not required_tool_satisfied:
+                    self._log_step_perf(
+                        ok=False,
+                        rounds=rounds_used,
+                        llm_calls=llm_calls,
+                        llm_ms=llm_ms_total,
+                        tool_calls=tool_calls_total,
+                        tool_ms=tool_ms_total,
+                        duration_ms=elapsed_ms(step_started),
+                        status="missing_required_tool_evidence",
+                    )
+                    return ExecutorRunResult(
+                        output_text=self._missing_required_file_tool_output(required_tool_name),
+                        tool_events=tool_events,
+                        error=error_payload(
+                            code=ErrorCode.TOOL_EXECUTION_ERROR,
+                            message=f"Missing successful `{required_tool_name}` evidence for file operation step",
+                            retryable=True,
+                        ),
+                    )
                 normalized_text = self._normalize_final_output(text)
+                self._log_step_perf(
+                    ok=True,
+                    rounds=rounds_used,
+                    llm_calls=llm_calls,
+                    llm_ms=llm_ms_total,
+                    tool_calls=tool_calls_total,
+                    tool_ms=tool_ms_total,
+                    duration_ms=elapsed_ms(step_started),
+                    status="success",
+                )
                 return ExecutorRunResult(output_text=normalized_text, tool_events=tool_events)
 
+        self._log_step_perf(
+            ok=False,
+            rounds=rounds_used,
+            llm_calls=llm_calls,
+            llm_ms=llm_ms_total,
+            tool_calls=tool_calls_total,
+            tool_ms=tool_ms_total,
+            duration_ms=elapsed_ms(step_started),
+            status="rounds_exceeded",
+        )
         return ExecutorRunResult(
             output_text="任务执行未收敛，请用户补充更具体要求。",
             tool_events=tool_events,

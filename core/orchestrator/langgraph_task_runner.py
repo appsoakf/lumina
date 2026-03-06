@@ -3,6 +3,7 @@ import time
 import json
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
@@ -10,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 
 from core.orchestrator.task_snapshot import step_result_from_node
 from core.protocols import CriticResult, ExecutorRunResult, PlanResult, TaskState
-from core.utils import elapsed_ms, log_event, log_exception
+from core.utils import bind_log_context, elapsed_ms, log_event, log_exception
 
 
 STEP_STATE_PENDING = "pending"
@@ -37,6 +38,7 @@ ACTION_RUN_STEPS = "run_ready_steps"
 ACTION_SELECT_STEPS = "select_ready_steps"
 ACTION_REVIEW = "review_task"
 ACTION_FINALIZE = "finalize_task"
+MAX_PARALLELISM_LIMIT = 2
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,7 @@ class LangGraphTaskRunner:
         return graph.compile()
 
     def _plan_task(self, state: TaskFlowState) -> TaskFlowState:
+        started = time.perf_counter()
         # resume 模式：优先复用已持久化 plan + snapshot，不重新规划。
         if state.get("resume_mode"):
             plan_result = state.get("resume_plan_result")
@@ -269,6 +272,26 @@ class LangGraphTaskRunner:
         state["ready_batch"] = []
         state["next_action"] = ACTION_SELECT_STEPS
         state["waiting_for_input"] = None
+        policy = dict(snapshot.get("policy") or {})
+        try:
+            max_parallelism = int(policy.get("max_parallelism", 1))
+        except Exception:
+            max_parallelism = 1
+        max_parallelism = min(max(max_parallelism, 1), MAX_PARALLELISM_LIMIT)
+        log_event(
+            logger,
+            logging.INFO,
+            "task.plan.done",
+            "任务规划完成",
+            component="orchestrator",
+            task_id=state["task_id"],
+            duration_ms=elapsed_ms(started),
+            resume_mode=bool(state.get("resume_mode")),
+            step_count=len(snapshot.get("nodes") or []),
+            max_parallelism=max_parallelism,
+            fail_fast=bool(policy.get("fail_fast", True)),
+            task_error=bool(first_error),
+        )
         return state
 
     def _select_ready_steps(self, state: TaskFlowState) -> TaskFlowState:
@@ -361,6 +384,7 @@ class LangGraphTaskRunner:
             executor_agent=executor_agent,
             history=state["history"],
             session_id=state["session_id"],
+            task_id=task_id,
         )
 
         # 记录 fail_fast 触发错误：
@@ -434,6 +458,7 @@ class LangGraphTaskRunner:
 
     def _review_task(self, state: TaskFlowState) -> TaskFlowState:
         # 评审节点只消费当前执行图，不改变节点状态，仅产出质量结论。
+        started = time.perf_counter()
         critic_agent = state["critic_agent"]
         critic_result = critic_agent.review_task(
             user_text=state["user_text"],
@@ -441,6 +466,17 @@ class LangGraphTaskRunner:
             execution_graph=state["task_snapshot"],
         )
         state["critic_result"] = critic_result
+        log_event(
+            logger,
+            logging.INFO,
+            "task.review.done",
+            "任务评审完成",
+            component="orchestrator",
+            task_id=state["task_id"],
+            duration_ms=elapsed_ms(started),
+            quality=str(critic_result.quality or ""),
+            suggestion_count=len(list(critic_result.suggestions or [])),
+        )
         return state
 
     def _finalize_task(self, state: TaskFlowState) -> TaskFlowState:
@@ -566,7 +602,7 @@ class LangGraphTaskRunner:
             value = int(raw)
         except Exception:
             value = 1
-        return max(value, 1)
+        return min(max(value, 1), MAX_PARALLELISM_LIMIT)
 
     def _fail_fast(self, snapshot: Dict[str, Any]) -> bool:
         policy = dict(snapshot.get("policy") or {})
@@ -581,7 +617,7 @@ class LangGraphTaskRunner:
         except Exception:
             max_parallelism = 1
         return {
-            "max_parallelism": max(max_parallelism, 1),
+            "max_parallelism": min(max(max_parallelism, 1), MAX_PARALLELISM_LIMIT),
             "fail_fast": bool(fail_fast),
         }
 
@@ -671,6 +707,7 @@ class LangGraphTaskRunner:
         executor_agent: Any,
         history: List[Dict[str, str]],
         session_id: str,
+        task_id: str,
     ) -> Dict[str, ExecutorRunResult]:
         """
         并发执行一批可运行 step，并按 step_id 收集执行结果。
@@ -702,16 +739,27 @@ class LangGraphTaskRunner:
             )
             return result, elapsed_ms(started)
 
+        def _invoke_step_with_context(step_id: str, step_input: str) -> Tuple[ExecutorRunResult, int]:
+            with bind_log_context(
+                session_id=session_id,
+                task_id=task_id,
+                step_id=step_id,
+            ):
+                return _invoke_step(step_input)
+
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             # future -> step_id 的映射用于后续反查：
             # as_completed 返回的是 future，需要通过该映射定位所属节点。
-            futures = {
-                pool.submit(
-                    _invoke_step,
+            futures = {}
+            for step_id, step_input in jobs:
+                parent_ctx = copy_context()
+                future = pool.submit(
+                    parent_ctx.run,
+                    _invoke_step_with_context,
+                    step_id,
                     step_input,
-                ): step_id
-                for step_id, step_input in jobs
-            }
+                )
+                futures[future] = step_id
 
             # as_completed 按“完成先后”返回 future，而不是按提交顺序。
             # 这样可以让快任务先被处理并尽早写入结果，提升整体吞吐。
@@ -727,6 +775,7 @@ class LangGraphTaskRunner:
                         "task.step.run.done",
                         f"步骤执行结束：{step_id}",
                         component="orchestrator",
+                        task_id=task_id,
                         step_id=step_id,
                         duration_ms=duration_ms,
                         ok=not bool(run_result.error),
@@ -739,6 +788,7 @@ class LangGraphTaskRunner:
                         "task.step.run.error",
                         f"步骤执行异常：{step_id}",
                         component="orchestrator",
+                        task_id=task_id,
                         step_id=step_id,
                         error_code="TOOL_EXECUTION_ERROR",
                         retryable=True,

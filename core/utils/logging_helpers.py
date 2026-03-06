@@ -5,6 +5,8 @@ import time
 from hashlib import sha1
 from typing import Any, Dict
 
+_CONTEXT_KEYS = ("session_id", "round", "task_id", "step_id")
+
 
 def elapsed_ms(start: float) -> int:
     return max(int((time.perf_counter() - start) * 1000), 0)
@@ -37,13 +39,18 @@ def log_event(
     message: str,
     **fields: Any,
 ) -> None:
+    event_fields = dict(fields or {})
+    extra = {
+        "event": str(event or "log.message"),
+        "event_fields": event_fields,
+    }
+    for key in _CONTEXT_KEYS:
+        if key in event_fields:
+            extra[key] = event_fields[key]
     logger.log(
         level,
         message,
-        extra={
-            "event": str(event or "log.message"),
-            "event_fields": dict(fields or {}),
-        },
+        extra=extra,
     )
 
 
@@ -53,10 +60,15 @@ def log_exception(
     message: str,
     **fields: Any,
 ) -> None:
+    event_fields = dict(fields or {})
+    extra = {
+        "event": str(event or "log.error"),
+        "event_fields": event_fields,
+    }
+    for key in _CONTEXT_KEYS:
+        if key in event_fields:
+            extra[key] = event_fields[key]
     logger.exception(
         message,
-        extra={
-            "event": str(event or "log.error"),
-            "event_fields": dict(fields or {}),
-        },
+        extra=extra,
     )

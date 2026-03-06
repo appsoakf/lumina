@@ -14,7 +14,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from core.config import LoggingConfig, load_app_config
 from core.utils import bind_log_context, log_event
-from core.utils.logging_setup import setup_logging
+from core.utils.logging_setup import ConsoleEventFilter, ConsoleFlowFormatter, setup_logging
 from summarize_metrics import summarize
 
 
@@ -108,6 +108,131 @@ class LoggingSystemTests(unittest.TestCase):
             self.assertGreater(result["latency_ms"]["round"]["p50_ms"], 0)
             self.assertGreater(result["latency_ms"]["llm_invoke"]["avg_ms"], 0)
             self.assertIn("TTS_CONNECTION_ERROR", result["error_code_counts"])
+
+    def test_console_event_filter_keeps_perf_info_and_all_warnings(self):
+        perf_filter = ConsoleEventFilter({"ws.round.start", "ws.round.end"})
+
+        allowed_info = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "ws.round.start",
+            }
+        )
+        blocked_info = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "llm.invoke.done",
+            }
+        )
+        allowed_error = logging.makeLogRecord(
+            {
+                "levelno": logging.ERROR,
+                "levelname": "ERROR",
+                "event": "llm.invoke.done",
+            }
+        )
+
+        self.assertTrue(perf_filter.filter(allowed_info))
+        self.assertFalse(perf_filter.filter(blocked_info))
+        self.assertTrue(perf_filter.filter(allowed_error))
+
+    def test_console_flow_formatter_renders_user_friendly_summary(self):
+        formatter = ConsoleFlowFormatter()
+        record = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "ws.round.summary",
+                "session_id": "s-1",
+                "round": "2",
+                "task_id": "t-1",
+                "step_id": "-",
+                "event_fields": {
+                    "intent": "task",
+                    "intent_ms": 160,
+                    "task_run_ms": 1020,
+                    "chat_llm_ms": 870,
+                    "tts_ms": 300,
+                    "round_total_ms": 4200,
+                },
+            }
+        )
+
+        line = formatter.format(record)
+        self.assertIn("[本轮汇总]", line)
+        self.assertIn("意图:任务", line)
+        self.assertIn("意图识别:160ms", line)
+        self.assertIn("编排执行:1020ms", line)
+        self.assertIn("对话LLM:870ms", line)
+        self.assertIn("总耗时:4200ms", line)
+        self.assertNotIn("session=", line)
+        self.assertNotIn("round=", line)
+        self.assertNotIn("task=", line)
+
+    def test_console_flow_formatter_renders_task_breakdown_events(self):
+        formatter = ConsoleFlowFormatter()
+
+        plan_record = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "task.plan.done",
+                "round": "1",
+                "event_fields": {
+                    "resume_mode": False,
+                    "step_count": 3,
+                    "max_parallelism": 2,
+                    "fail_fast": True,
+                    "duration_ms": 1200,
+                },
+            }
+        )
+        plan_line = formatter.format(plan_record)
+        self.assertIn("[任务规划]", plan_line)
+        self.assertIn("3 个步骤", plan_line)
+        self.assertIn("并行度 2", plan_line)
+
+        step_record = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "executor.step.done",
+                "step_id": "S1",
+                "event_fields": {
+                    "ok": True,
+                    "rounds": 2,
+                    "llm_calls": 2,
+                    "llm_ms": 1800,
+                    "tool_calls": 1,
+                    "tool_ms": 220,
+                    "duration_ms": 2200,
+                },
+            }
+        )
+        step_line = formatter.format(step_record)
+        self.assertIn("[步骤细分]", step_line)
+        self.assertIn("S1 成功", step_line)
+        self.assertIn("LLM:2次/1800ms", step_line)
+        self.assertIn("工具:1次/220ms", step_line)
+
+        review_record = logging.makeLogRecord(
+            {
+                "levelno": logging.INFO,
+                "levelname": "INFO",
+                "event": "task.review.done",
+                "event_fields": {
+                    "quality": "pass",
+                    "suggestion_count": 1,
+                    "duration_ms": 640,
+                },
+            }
+        )
+        review_line = formatter.format(review_record)
+        self.assertIn("[任务评审]", review_line)
+        self.assertIn("评审通过", review_line)
+        self.assertIn("建议 1 条", review_line)
 
 
 if __name__ == "__main__":

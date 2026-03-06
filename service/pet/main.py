@@ -230,6 +230,12 @@ def consume_and_send(ws, ordered_map: OrderedSentenceMap):
 
 def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, round_num: int):
     started = time.perf_counter()
+    def _as_int(payload: dict, key: str, default: int = -1) -> int:
+        try:
+            return int(payload.get(key))
+        except Exception:
+            return default
+
     summary = summarize_text(
         user_text,
         preview_chars=app_config.logging.user_text_preview_chars,
@@ -253,15 +259,21 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
         tool_events = []
         route_intent: Optional[str] = None
         route_task_id: Optional[str] = None
+        route_meta: dict = {}
+        route_perf: dict = {}
+        route_duration_ms = -1
+        tts_total_ms = -1
         try:
             route_start = time.perf_counter()
             orchestrated = orchestrator.handle_user_message(
                 user_text=user_text,
                 session_id=session_id,
             )
+            route_duration_ms = elapsed_ms(route_start)
             full_reply = orchestrated.final_reply
             route_intent = orchestrated.intent.value
             route_task_id = str(orchestrated.meta.get("task_id") or "").strip() or None
+            route_perf = dict(orchestrated.meta.get("perf") or {})
 
             route_meta = {
                 "task_mode": bool(orchestrated.meta.get("task_mode")),
@@ -287,7 +299,7 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
                 logging.INFO,
                 "orchestrator.route.done",
                 "编排路由完成",
-                duration_ms=elapsed_ms(route_start),
+                duration_ms=route_duration_ms,
                 intent=route_intent,
                 task_id=route_task_id or "-",
                 task_mode=route_meta["task_mode"],
@@ -340,6 +352,7 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
             )
 
             # sentence split -> parallel workers
+            tts_total_start = time.perf_counter()
             text_buffer = cn_text
             sentences, text_buffer = split_sentences(text_buffer)
             for s in sentences:
@@ -388,6 +401,16 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
                 duration_ms=elapsed_ms(audio_start),
                 sentence_count=sentence_index,
             )
+            tts_total_ms = elapsed_ms(tts_total_start)
+            log_event(
+                logger,
+                logging.INFO,
+                "pipeline.tts.total.done",
+                "语音阶段处理完成",
+                duration_ms=tts_total_ms,
+                sentence_count=sentence_index,
+                enable_tts=bool(ENABLE_TTS and tts is not None),
+            )
 
             orchestrator.record_session_round(
                 session_id=session_id,
@@ -429,14 +452,31 @@ def handle_bot_reply(ws, user_text: str, session_id: str, trace: TraceLogger, ro
             )
         finally:
             ws_send(ws, {"type": "done"})
-            round_cost_sec = round(elapsed_ms(started) / 1000, 2)
+            round_duration_ms = elapsed_ms(started)
+            round_cost_sec = round(round_duration_ms / 1000, 2)
             trace.log("round_end", {"round": round_num, "cost_sec": round_cost_sec})
+            log_event(
+                logger,
+                logging.INFO,
+                "ws.round.summary",
+                f"第 {round_num} 轮性能摘要",
+                intent=route_intent or "-",
+                task_id=route_task_id or "-",
+                duration_ms=round_duration_ms,
+                route_ms=route_duration_ms,
+                intent_ms=_as_int(route_perf, "intent_ms"),
+                task_run_ms=_as_int(route_perf, "task_run_ms"),
+                chat_llm_ms=_as_int(route_perf, "chat_llm_ms"),
+                orchestrator_ms=_as_int(route_perf, "orchestrator_ms"),
+                tts_ms=tts_total_ms,
+                round_total_ms=round_duration_ms,
+            )
             log_event(
                 logger,
                 logging.INFO,
                 "ws.round.end",
                 f"第 {round_num} 轮处理结束",
-                duration_ms=elapsed_ms(started),
+                duration_ms=round_duration_ms,
                 tool_event_count=len(tool_events),
                 route_intent=route_intent or "-",
                 task_id=route_task_id or "-",

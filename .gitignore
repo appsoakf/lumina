@@ -8,3 +8,4 @@ AGENTS.md
 .vscode
 /.claude/
 config.json
+console.log

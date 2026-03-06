@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from core.agentic.chat_agent import ChatAgent
@@ -21,7 +22,7 @@ from core.protocols import (
     TaskState,
 )
 from core.tasks import TaskManager
-from core.utils import log_exception
+from core.utils import bind_log_context, elapsed_ms, log_event, log_exception
 
 logger = logging.getLogger(__name__)
 
@@ -469,10 +470,22 @@ class Orchestrator:
             step_results=task_run.step_results,
         )
 
+        chat_started = time.perf_counter()
         final_reply = chat_agent.reply_with_task_result(
             user_text=user_text,
             executor_output=executor_result.output_text,
             history=history,
+        )
+        chat_llm_ms = elapsed_ms(chat_started)
+        log_event(
+            logger,
+            logging.INFO,
+            "orchestrator.chat.reply.done",
+            "任务结果回复生成完成",
+            component="orchestrator",
+            task_id=task_id,
+            intent=RoutingIntent.TASK.value,
+            duration_ms=chat_llm_ms,
         )
 
         waiting_payload = task_run.waiting_for_input or {}
@@ -490,6 +503,9 @@ class Orchestrator:
             "task_required_fields": list(waiting_payload.get("required_fields") or []),
             "task_round_count": int(round_count),
             "task_replan_count": int(replan_count),
+            "perf": {
+                "chat_llm_ms": chat_llm_ms,
+            },
         }
 
         return OrchestrationResult(
@@ -512,114 +528,226 @@ class Orchestrator:
         D. 新请求做 chat/task 路由；
         E. task 模式下执行有界收敛循环并落盘状态。
         """
-        # A) 读取短期对话历史（上一轮 user/assistant 消息）。
-        history = self._memory.get_recent_history(session_id=session_id)
+        started = time.perf_counter()
+        intent_name = "-"
+        flow_mode = "unknown"
+        task_id_for_log = "-"
+        intent_ms = -1
+        task_run_ms = -1
+        chat_llm_ms = -1
 
-        # B) 将长期记忆注入到历史头部，提升跨轮连续性。
-        enriched_history = self._augment_history_with_memory(history=history, query=user_text)
+        def _to_int(value: Any, default: int = -1) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return default
 
-        # C) waiting 任务恢复：若存在等待补充信息的任务，本轮输入优先作为补充继续执行。
-        #    该路径沿用原 task_id，不会新建任务，保证任务链路连续可追踪。
-        waiting_task = self._task_manager.get_waiting_task(session_id=session_id)
-        if waiting_task is not None:
-            resumed_task, resumed, waiting_payload = self._task_manager.resume_waiting_task(
-                waiting_task.task_id,
-                user_reply=user_text,
+        def _attach_perf(meta: Dict[str, Any]) -> None:
+            nonlocal chat_llm_ms
+            perf_payload = dict(meta.get("perf") or {})
+            candidate_chat_llm = _to_int(perf_payload.get("chat_llm_ms"), default=chat_llm_ms)
+            if candidate_chat_llm >= 0:
+                chat_llm_ms = candidate_chat_llm
+            perf_payload.update(
+                {
+                    "intent_ms": intent_ms,
+                    "task_run_ms": task_run_ms,
+                    "chat_llm_ms": chat_llm_ms,
+                    "orchestrator_ms": elapsed_ms(started),
+                }
             )
-            if resumed and resumed_task is not None:
-                plan_payload = resumed_task.plan if isinstance(resumed_task.plan, dict) else {}
-                plan_result = self._plan_result_from_dict(plan_payload, user_text=resumed_task.user_text)
-                snapshot = resumed_task.task_snapshot if isinstance(resumed_task.task_snapshot, dict) else {}
-                prev_round_count = int((resumed_task.convergence or {}).get("round_count", 0))
-                prev_replan_count = int((resumed_task.convergence or {}).get("replan_count", 0))
-                round_count = prev_round_count + 1
+            meta["perf"] = perf_payload
 
+        try:
+            # A) 读取短期对话历史（上一轮 user/assistant 消息）。
+            history = self._memory.get_recent_history(session_id=session_id)
+
+            # B) 将长期记忆注入到历史头部，提升跨轮连续性。
+            enriched_history = self._augment_history_with_memory(history=history, query=user_text)
+
+            # C) waiting 任务恢复：若存在等待补充信息的任务，本轮输入优先作为补充继续执行。
+            #    该路径沿用原 task_id，不会新建任务，保证任务链路连续可追踪。
+            waiting_task = self._task_manager.get_waiting_task(session_id=session_id)
+            if waiting_task is not None:
+                resumed_task, resumed, waiting_payload = self._task_manager.resume_waiting_task(
+                    waiting_task.task_id,
+                    user_reply=user_text,
+                )
+                if resumed and resumed_task is not None:
+                    flow_mode = "task_resume"
+                    intent_name = RoutingIntent.TASK.value
+                    task_id_for_log = resumed_task.task_id
+                    with bind_log_context(task_id=resumed_task.task_id):
+                        plan_payload = resumed_task.plan if isinstance(resumed_task.plan, dict) else {}
+                        plan_result = self._plan_result_from_dict(plan_payload, user_text=resumed_task.user_text)
+                        snapshot = resumed_task.task_snapshot if isinstance(resumed_task.task_snapshot, dict) else {}
+                        prev_round_count = int((resumed_task.convergence or {}).get("round_count", 0))
+                        prev_replan_count = int((resumed_task.convergence or {}).get("replan_count", 0))
+                        round_count = prev_round_count + 1
+
+                        task_started = time.perf_counter()
+                        task_run, replan_used = self._run_with_convergence_loop(
+                            user_text=resumed_task.user_text,
+                            history=enriched_history,
+                            session_id=session_id,
+                            task_id=resumed_task.task_id,
+                            resume_plan_result=plan_result,
+                            resume_snapshot=snapshot,
+                            resume_waiting_payload=waiting_payload,
+                            resume_user_reply=user_text,
+                        )
+                        task_run_ms = elapsed_ms(task_started)
+                        task_run = self._mark_not_converged_if_needed(
+                            task_id=resumed_task.task_id,
+                            task_run=task_run,
+                            round_count=round_count,
+                        )
+                        total_replan_count = prev_replan_count + int(replan_used)
+                        self._task_manager.update_convergence(
+                            resumed_task.task_id,
+                            {
+                                "round_count": round_count,
+                                "replan_count": total_replan_count,
+                                "last_progress_score": 1 if not task_run.waiting_for_input else 0,
+                            },
+                        )
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "orchestrator.task.run.done",
+                            "任务编排执行完成",
+                            component="orchestrator",
+                            task_id=resumed_task.task_id,
+                            duration_ms=task_run_ms,
+                            round_count=round_count,
+                            replan_count=total_replan_count,
+                            step_count=len(task_run.task_snapshot.get("nodes") or []),
+                            task_waiting_input=bool(task_run.waiting_for_input),
+                            task_error=bool(task_run.first_error),
+                        )
+                        result = self._build_task_orchestration_result(
+                            user_text=user_text,
+                            history=enriched_history,
+                            task_id=resumed_task.task_id,
+                            task_run=task_run,
+                            round_count=round_count,
+                            replan_count=total_replan_count,
+                        )
+                    _attach_perf(result.meta)
+                    self._record_memory(session_id, user_text, result.final_reply, result.meta)
+                    return result
+
+            # D) 常规路由：先判定 CHAT 还是 TASK。
+            _, chat_agent = self._resolve_agent("chat")
+            intent_started = time.perf_counter()
+            intent = chat_agent.classify_intent(user_text=user_text, history=enriched_history)
+            intent_ms = elapsed_ms(intent_started)
+            intent_name = intent.value
+            log_event(
+                logger,
+                logging.INFO,
+                "orchestrator.intent.done",
+                "意图识别完成",
+                component="orchestrator",
+                intent=intent_name,
+                duration_ms=intent_ms,
+            )
+
+            if intent == RoutingIntent.CHAT:
+                # CHAT：直接由 chat_agent 响应，不进入任务状态机。
+                flow_mode = "chat"
+                chat_started = time.perf_counter()
+                final_reply = chat_agent.reply_chat(user_text=user_text, history=enriched_history)
+                chat_llm_ms = elapsed_ms(chat_started)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "orchestrator.chat.reply.done",
+                    "对话回复生成完成",
+                    component="orchestrator",
+                    intent=RoutingIntent.CHAT.value,
+                    duration_ms=chat_llm_ms,
+                )
+                meta = {"agent_chain": ["chat_agent"], "task_mode": False}
+                _attach_perf(meta)
+                self._record_memory(session_id, user_text, final_reply, meta)
+                return OrchestrationResult(
+                    intent=RoutingIntent.CHAT,
+                    final_reply=final_reply,
+                    executor_result=None,
+                    meta=meta,
+                )
+
+            # E) TASK：创建任务并进入收敛循环（包含可重试 replan）。
+            flow_mode = "task_new"
+            task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
+            task_id = task.task_id
+            task_id_for_log = task_id
+            self._task_manager.set_state(task_id, TaskState.RUNNING)
+            round_count = 1
+            with bind_log_context(task_id=task_id):
+                task_started = time.perf_counter()
                 task_run, replan_used = self._run_with_convergence_loop(
-                    user_text=resumed_task.user_text,
+                    user_text=user_text,
                     history=enriched_history,
                     session_id=session_id,
-                    task_id=resumed_task.task_id,
-                    resume_plan_result=plan_result,
-                    resume_snapshot=snapshot,
-                    resume_waiting_payload=waiting_payload,
-                    resume_user_reply=user_text,
+                    task_id=task_id,
                 )
+                task_run_ms = elapsed_ms(task_started)
                 task_run = self._mark_not_converged_if_needed(
-                    task_id=resumed_task.task_id,
+                    task_id=task_id,
                     task_run=task_run,
                     round_count=round_count,
                 )
-                total_replan_count = prev_replan_count + int(replan_used)
+                total_replan_count = int(replan_used)
                 self._task_manager.update_convergence(
-                    resumed_task.task_id,
+                    task_id,
                     {
                         "round_count": round_count,
                         "replan_count": total_replan_count,
                         "last_progress_score": 1 if not task_run.waiting_for_input else 0,
                     },
                 )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "orchestrator.task.run.done",
+                    "任务编排执行完成",
+                    component="orchestrator",
+                    task_id=task_id,
+                    duration_ms=task_run_ms,
+                    round_count=round_count,
+                    replan_count=total_replan_count,
+                    step_count=len(task_run.task_snapshot.get("nodes") or []),
+                    task_waiting_input=bool(task_run.waiting_for_input),
+                    task_error=bool(task_run.first_error),
+                )
                 result = self._build_task_orchestration_result(
                     user_text=user_text,
                     history=enriched_history,
-                    task_id=resumed_task.task_id,
+                    task_id=task_id,
                     task_run=task_run,
                     round_count=round_count,
                     replan_count=total_replan_count,
                 )
-                self._record_memory(session_id, user_text, result.final_reply, result.meta)
-                return result
-
-        # D) 常规路由：先判定 CHAT 还是 TASK。
-        _, chat_agent = self._resolve_agent("chat")
-        intent = chat_agent.classify_intent(user_text=user_text, history=enriched_history)
-
-        if intent == RoutingIntent.CHAT:
-            # CHAT：直接由 chat_agent 响应，不进入任务状态机。
-            final_reply = chat_agent.reply_chat(user_text=user_text, history=enriched_history)
-            meta = {"agent_chain": ["chat_agent"], "task_mode": False}
-            self._record_memory(session_id, user_text, final_reply, meta)
-            return OrchestrationResult(
-                intent=RoutingIntent.CHAT,
-                final_reply=final_reply,
-                executor_result=None,
-                meta=meta,
+            _attach_perf(result.meta)
+            self._record_memory(session_id, user_text, result.final_reply, result.meta)
+            return result
+        finally:
+            log_event(
+                logger,
+                logging.INFO,
+                "orchestrator.handle.done",
+                "编排入口处理完成",
+                component="orchestrator",
+                intent=intent_name,
+                task_id=task_id_for_log,
+                flow=flow_mode,
+                duration_ms=elapsed_ms(started),
+                intent_ms=intent_ms,
+                task_run_ms=task_run_ms,
+                chat_llm_ms=chat_llm_ms,
             )
-
-        # E) TASK：创建任务并进入收敛循环（包含可重试 replan）。
-        task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
-        task_id = task.task_id
-        self._task_manager.set_state(task_id, TaskState.RUNNING)
-        round_count = 1
-        task_run, replan_used = self._run_with_convergence_loop(
-            user_text=user_text,
-            history=enriched_history,
-            session_id=session_id,
-            task_id=task_id,
-        )
-        task_run = self._mark_not_converged_if_needed(
-            task_id=task_id,
-            task_run=task_run,
-            round_count=round_count,
-        )
-        total_replan_count = int(replan_used)
-        self._task_manager.update_convergence(
-            task_id,
-            {
-                "round_count": round_count,
-                "replan_count": total_replan_count,
-                "last_progress_score": 1 if not task_run.waiting_for_input else 0,
-            },
-        )
-        result = self._build_task_orchestration_result(
-            user_text=user_text,
-            history=enriched_history,
-            task_id=task_id,
-            task_run=task_run,
-            round_count=round_count,
-            replan_count=total_replan_count,
-        )
-        self._record_memory(session_id, user_text, result.final_reply, result.meta)
-        return result
 
     def close(self) -> None:
         # 释放底层资源（例如 memory 异步线程/连接）。
