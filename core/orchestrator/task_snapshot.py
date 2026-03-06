@@ -6,12 +6,11 @@ def completed_context(task_snapshot: Dict[str, Any]) -> str:
     lines: List[str] = []
     for node in task_snapshot.get("nodes") or []:
         state = str(node.get("state") or "")
-        if state not in {"succeeded", "failed", "cancelled", "blocked"}:
+        if state not in {"succeeded", "failed", "blocked"}:
             continue
         status = {
             "succeeded": "成功",
             "failed": "失败",
-            "cancelled": "取消",
             "blocked": "阻塞",
         }.get(state, state)
         lines.append(f"[{node.get('step_id')}:{status}] {node.get('title')}: {node.get('output_text')}")

@@ -11,7 +11,6 @@ from core.config import load_app_config
 from core.memory import MemoryService
 from core.orchestrator.langgraph_task_runner import LangGraphTaskRunner
 from core.orchestrator.task_snapshot import completed_context, resolve_step_inputs
-from core.orchestrator.task_shortcuts import execute_task_shortcut
 from core.protocols import (
     CriticResult,
     ExecutorRunResult,
@@ -28,7 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Orchestrator: dynamic routing + task lifecycle + memory system."""
+    """
+    Orchestrator: 统一编排入口（路由 + 任务生命周期 + 记忆读写）。
+
+    这层的核心职责是把“用户一轮输入”收敛成可交付结果，并保证：
+    1) service 只依赖公开接口，不感知内部 agent/task/memory 细节；
+    2) task 模式下支持可恢复执行（waiting_user_input -> resume）；
+    3) 出错时有界重规划，不无限循环；
+    4) 每轮对话可沉淀可检索记忆。
+    """
 
     def __init__(
         self,
@@ -40,24 +47,30 @@ class Orchestrator:
         task_manager: Optional[TaskManager] = None,
         memory_service: Optional[MemoryService] = None,
     ):
+        # 统一管理各能力代理，后续通过 capability -> agent_name 动态解析。
         self._agents = {
             "chat_agent": chat_agent or ChatAgent(),
             "planner_agent": planner_agent or PlannerAgent(),
             "executor_agent": executor_agent or ExecutorAgent(),
             "critic_agent": critic_agent or CriticAgent(),
         }
+        # capabilities 决定“某项能力由哪个 agent 承担”，避免硬编码调用关系。
         self.capabilities = capability_registry or build_default_registry()
+        # task manager 负责持久化任务状态机；memory service 负责短/长期记忆。
         self._task_manager = task_manager or TaskManager()
         self._memory = memory_service or MemoryService()
+        # task runner 封装 LangGraph 调度细节；orchestrator 仅按公共 run 接口调用。
         self._task_runner = LangGraphTaskRunner(
             task_manager=self._task_manager,
             build_step_input=self._build_step_task_input,
         )
+        # 收敛护栏：限制自动 replan/clarify 次数，避免任务链路失控。
         task_flow_cfg = load_app_config().task_flow
         self._max_replan_rounds = max(int(task_flow_cfg.max_replan_rounds), 0)
         self._max_clarify_rounds = max(int(task_flow_cfg.max_clarify_rounds), 1)
 
     def _resolve_agent(self, capability: str):
+        # 通过能力名解析具体 agent；该映射由 CapabilityRegistry 统一维护。
         agent_name = self.capabilities.resolve_agent(capability)
         agent = self._agents.get(agent_name)
         if agent is None:
@@ -65,6 +78,8 @@ class Orchestrator:
         return agent_name, agent
 
     def _augment_history_with_memory(self, history: List[Dict[str, str]], query: str) -> List[Dict[str, str]]:
+        # 查询长期记忆并前置到 system message，作为“软上下文注入”。
+        # 注意：明确声明“当前用户指令优先”，防止旧记忆覆盖本轮意图。
         context = self._memory.build_context(query=query)
         if not context:
             return list(history)
@@ -78,6 +93,7 @@ class Orchestrator:
         return [mem_msg] + list(history[-12:])
 
     def _record_memory(self, session_id: str, user_text: str, final_reply: str, meta: Dict) -> None:
+        # 记忆写入采用 fail-soft：失败只记录日志，不中断主响应链路。
         try:
             self._memory.ingest_turn(
                 session_id=session_id,
@@ -101,6 +117,7 @@ class Orchestrator:
         assistant_reply: str,
         metadata: Optional[Dict[str, object]] = None,
     ) -> None:
+        # 对外公开的短期会话落盘入口（供 service 在一轮结束后调用）。
         self._memory.record_session_round(
             session_id=session_id,
             user_text=user_text,
@@ -117,7 +134,7 @@ class Orchestrator:
         if node is None:
             raise ValueError(f"Unknown step_id: {step_id}")
         
-        # 把步骤（成功/失败/取消/阻塞）的结果拼成文本，给当前步骤提供历史上下文
+        # 把步骤（成功/失败/阻塞）的结果拼成文本，给当前步骤提供历史上下文
         completed = completed_context(task_snapshot)
         bound_inputs = resolve_step_inputs(task_snapshot, step_id=step_id)
         binding_text = json.dumps(bound_inputs, ensure_ascii=False, indent=2) if bound_inputs else "无"
@@ -142,6 +159,8 @@ class Orchestrator:
         resume_waiting_payload: Optional[Dict[str, Any]] = None,
         resume_user_reply: str = "",
     ):
+        # task 模式统一委托给 LangGraphTaskRunner。
+        # 这里仅做 agent 解析与参数透传，不掺杂图调度细节。
         _, planner_agent = self._resolve_agent("task_planning")
         _, executor_agent = self._resolve_agent("task_execution")
         _, critic_agent = self._resolve_agent("task_review")
@@ -188,6 +207,8 @@ class Orchestrator:
         return ""
 
     def _plan_result_from_dict(self, payload: Dict[str, Any], user_text: str) -> PlanResult:
+        # waiting 任务恢复时，plan/task_snapshot 来自持久化 JSON；
+        # 这里负责把 dict 重新归一为 PlanResult 数据结构。
         raw_steps = payload.get("steps") or []
         steps: List[PlanItem] = []
         for idx, item in enumerate(raw_steps, start=1):
@@ -224,6 +245,8 @@ class Orchestrator:
         )
 
     def _compose_waiting_executor_output(self, task_snapshot: Dict[str, Any], waiting_for_input: Dict[str, Any]) -> str:
+        # 当任务进入 waiting_user_input 时，生成给 chat_agent 的中间可读描述。
+        # chat_agent 会基于该文本组织最终对用户的追问回复。
         question = str(waiting_for_input.get("clarify_question") or "").strip()
         required_fields = [str(v).strip() for v in (waiting_for_input.get("required_fields") or []) if str(v).strip()]
         summary = str(waiting_for_input.get("summary") or "当前任务需要补充信息。").strip()
@@ -241,6 +264,7 @@ class Orchestrator:
         return "\n".join(lines)
 
     def _task_not_converged_error(self, *, reason: str) -> Dict[str, Any]:
+        # 统一“未收敛”错误结构，便于前端和上层链路识别重试语义。
         return {
             "code": "TASK_NOT_CONVERGED",
             "message": reason,
@@ -248,17 +272,21 @@ class Orchestrator:
         }
 
     def _should_replan(self, task_run: Any) -> bool:
+        # replan 触发条件：
+        # 1) 非 waiting（等待用户补充时不自动重规划）；
+        # 2) 存在首错；
+        # 3) 错误标记为可重试。
         if task_run.waiting_for_input:
             return False
         if task_run.first_error:
             error = task_run.first_error or {}
-            if str(error.get("code") or "").strip() == "TASK_CANCELLED":
-                return False
             retryable = bool(error.get("retryable", True))
             return retryable
         return False
 
     def _compose_replan_user_text(self, *, original_user_text: str, task_run: Any, round_index: int) -> str:
+        # 将“原始目标 + 上轮失败信息 + critic建议”组合成下一轮 planner 输入，
+        # 让 replan 具备上下文连续性，而不是盲目重试同一方案。
         lines = [
             original_user_text,
             "",
@@ -285,6 +313,8 @@ class Orchestrator:
         task_run: Any,
         round_count: int,
     ) -> Any:
+        # waiting_user_input 超过阈值后，主动转 failed(TASK_NOT_CONVERGED)。
+        # 这样可以避免任务长期停在等待态造成“假活跃”。
         if not task_run.waiting_for_input:
             return task_run
         if round_count < self._max_clarify_rounds:
@@ -315,6 +345,14 @@ class Orchestrator:
         resume_waiting_payload: Optional[Dict[str, Any]] = None,
         resume_user_reply: str = "",
     ) -> tuple[Any, int]:
+        """
+        任务收敛主循环：
+        1) 先跑一轮 task graph；
+        2) 若命中可重试错误则触发有界 replan；
+        3) 否则返回当前结果。
+
+        返回值：(task_run, replan_used)
+        """
         replan_used = 0
         current_user_text = user_text
         use_resume = resume_plan_result is not None and resume_snapshot is not None
@@ -324,6 +362,7 @@ class Orchestrator:
         current_resume_reply = resume_user_reply
 
         while True:
+            # 单轮执行：可能是新任务，也可能是 waiting 恢复任务。
             task_run = self._run_task_mode(
                 user_text=current_user_text,
                 history=history,
@@ -340,17 +379,20 @@ class Orchestrator:
             current_waiting_payload = None
             current_resume_reply = ""
 
+            # 不需要 replan 时，直接结束循环并返回当前结果。
             if not self._should_replan(task_run):
                 return task_run, replan_used
             if replan_used >= self._max_replan_rounds:
+                # 超出 replan 预算：标记 failed 并返回，防止无限自旋。
                 reason = f"Replan rounds exceeded max_replan_rounds={self._max_replan_rounds}"
                 error = self._task_not_converged_error(reason=reason)
                 task_run.first_error = error
                 self._task_manager.set_state(task_id, TaskState.FAILED, error=error)
                 return task_run, replan_used
 
+            # 进入下一轮自动重试：先把任务状态回退到 RUNNING，再更新 planner 输入。
             replan_used += 1
-            self._task_manager.retry_task(task_id)
+            self._task_manager.reset_task_for_replan(task_id)
             self._task_manager.set_state(task_id, TaskState.RUNNING)
             current_user_text = self._compose_replan_user_text(
                 original_user_text=user_text,
@@ -359,6 +401,7 @@ class Orchestrator:
             )
 
     def _compose_general_executor_output(self, task_snapshot: Dict[str, object], critic: CriticResult) -> str:
+        # 将 task graph 快照归一为可读执行摘要，供 chat_agent 二次组织自然语言回复。
         lines = [f"任务目标: {task_snapshot.get('goal', '')}", "", "执行进展:"]
         for node in task_snapshot.get("nodes") or []:
             state_value = str(node.get("state") or "")
@@ -369,7 +412,6 @@ class Orchestrator:
                 "ready": "就绪",
                 "pending": "待执行",
                 "blocked": "阻塞",
-                "cancelled": "已取消",
                 "skipped": "跳过",
                 "waiting_user_input": "等待补充信息",
             }.get(state_value, state_value)
@@ -394,21 +436,6 @@ class Orchestrator:
                 lines.append(f"- {s}")
         return "\n".join(lines)
 
-    def _handle_task_shortcut(
-        self,
-        user_text: str,
-        session_id: str,
-        history: List[Dict[str, str]],
-    ) -> Optional[OrchestrationResult]:
-        _, chat_agent = self._resolve_agent("chat")
-        return execute_task_shortcut(
-            user_text=user_text,
-            session_id=session_id,
-            history=history,
-            task_manager=self._task_manager,
-            chat_agent=chat_agent,
-        )
-
     def _build_task_orchestration_result(
         self,
         *,
@@ -419,6 +446,9 @@ class Orchestrator:
         round_count: int,
         replan_count: int,
     ) -> OrchestrationResult:
+        # 1) 先把 task_run 转成 executor_result（统一兼容字段结构）；
+        # 2) 再交给 chat_agent 生成人类可读最终回复；
+        # 3) 最后组装完整 meta，供 service/日志/前端消费。
         _, chat_agent = self._resolve_agent("chat")
 
         if task_run.waiting_for_input:
@@ -474,21 +504,22 @@ class Orchestrator:
         user_text: str,
         session_id: str,
     ) -> OrchestrationResult:
+        """
+        单轮编排主入口（service 层唯一需要调用的方法）：
+        A. 读取短期历史；
+        B. 注入长期记忆上下文；
+        C. 优先恢复 waiting 任务；
+        D. 新请求做 chat/task 路由；
+        E. task 模式下执行有界收敛循环并落盘状态。
+        """
+        # A) 读取短期对话历史（上一轮 user/assistant 消息）。
         history = self._memory.get_recent_history(session_id=session_id)
 
-        # task shortcuts, e.g. /cancel and /retry
-        shortcut_result = self._handle_task_shortcut(
-            user_text=user_text,
-            session_id=session_id,
-            history=history,
-        )
-        if shortcut_result is not None:
-            self._record_memory(session_id, user_text, shortcut_result.final_reply, shortcut_result.meta)
-            return shortcut_result
-
+        # B) 将长期记忆注入到历史头部，提升跨轮连续性。
         enriched_history = self._augment_history_with_memory(history=history, query=user_text)
 
-        # waiting task resume: 优先把本轮输入作为补充信息，继续已有任务
+        # C) waiting 任务恢复：若存在等待补充信息的任务，本轮输入优先作为补充继续执行。
+        #    该路径沿用原 task_id，不会新建任务，保证任务链路连续可追踪。
         waiting_task = self._task_manager.get_waiting_task(session_id=session_id)
         if waiting_task is not None:
             resumed_task, resumed, waiting_payload = self._task_manager.resume_waiting_task(
@@ -538,11 +569,12 @@ class Orchestrator:
                 self._record_memory(session_id, user_text, result.final_reply, result.meta)
                 return result
 
-        # 意图识别
+        # D) 常规路由：先判定 CHAT 还是 TASK。
         _, chat_agent = self._resolve_agent("chat")
         intent = chat_agent.classify_intent(user_text=user_text, history=enriched_history)
 
         if intent == RoutingIntent.CHAT:
+            # CHAT：直接由 chat_agent 响应，不进入任务状态机。
             final_reply = chat_agent.reply_chat(user_text=user_text, history=enriched_history)
             meta = {"agent_chain": ["chat_agent"], "task_mode": False}
             self._record_memory(session_id, user_text, final_reply, meta)
@@ -553,7 +585,7 @@ class Orchestrator:
                 meta=meta,
             )
 
-        # task mode
+        # E) TASK：创建任务并进入收敛循环（包含可重试 replan）。
         task = self._task_manager.create_task(session_id=session_id, user_text=user_text)
         task_id = task.task_id
         self._task_manager.set_state(task_id, TaskState.RUNNING)
@@ -590,6 +622,7 @@ class Orchestrator:
         return result
 
     def close(self) -> None:
+        # 释放底层资源（例如 memory 异步线程/连接）。
         close_fn = getattr(self._memory, "close", None)
         if callable(close_fn):
             close_fn()

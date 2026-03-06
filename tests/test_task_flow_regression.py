@@ -1,6 +1,5 @@
 import shutil
 import sys
-import threading
 import time
 import unittest
 import uuid
@@ -12,17 +11,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.capabilities.registry import build_default_registry
 from core.orchestrator.langgraph_task_runner import LangGraphTaskRunner
-from core.orchestrator.task_shortcuts import execute_task_shortcut, parse_task_shortcut
 from core.utils.trace_logger import TraceLogger
 from core.protocols import CriticResult, ExecutorRunResult, PlanItem, PlanResult, TaskState
 from core.tasks.manager import TaskManager
 from core.tasks.store import TaskStore
-
-
-class _FakeChatAgent:
-    def reply_with_task_result(self, user_text, executor_output, history):
-        _ = user_text, history
-        return executor_output
 
 
 class _FakeExecutorAgent:
@@ -123,21 +115,18 @@ class TaskFlowRegressionTests(unittest.TestCase):
         self.assertEqual(loaded.plan.get("goal"), "x")
         self.assertEqual(len(loaded.step_results), 1)
 
-    def test_task_manager_cancel_and_retry(self):
+    def test_task_manager_reset_for_replan_from_failed(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
         manager = TaskManager(store=store)
 
-        t = manager.create_task(session_id="s1", user_text="cancel me")
+        t = manager.create_task(session_id="s1", user_text="needs reset")
         self.assertTrue(manager.set_state(t.task_id, TaskState.RUNNING))
-        self.assertTrue(manager.cancel_task(t.task_id))
-
-        cancelled = manager.get_task(t.task_id)
-        self.assertEqual(cancelled.state, TaskState.CANCELLED)
-
-        retried = manager.retry_task(t.task_id)
-        self.assertIsNotNone(retried)
-        self.assertEqual(retried.state, TaskState.PENDING)
-        self.assertEqual(retried.step_results, [])
+        self.assertTrue(manager.set_state(t.task_id, TaskState.FAILED, error={"code": "X"}))
+        self.assertTrue(manager.reset_task_for_replan(t.task_id))
+        reset = manager.get_task(t.task_id)
+        self.assertEqual(reset.state, TaskState.PENDING)
+        self.assertEqual(reset.step_results, [])
+        self.assertIsNone(reset.error)
 
     def test_task_manager_rejects_invalid_transition(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
@@ -145,36 +134,36 @@ class TaskFlowRegressionTests(unittest.TestCase):
 
         t = manager.create_task(session_id="s1", user_text="guard transitions")
         self.assertTrue(manager.set_state(t.task_id, TaskState.RUNNING))
-        self.assertTrue(manager.cancel_task(t.task_id))
+        self.assertTrue(manager.set_state(t.task_id, TaskState.FAILED, error={"code": "X"}))
 
-        # Once cancelled, it should not be overwritten by finalize-style success.
+        # Once failed, it should not be overwritten by finalize-style success.
         self.assertFalse(manager.set_state(t.task_id, TaskState.SUCCEEDED))
-        self.assertEqual(manager.get_task(t.task_id).state, TaskState.CANCELLED)
+        self.assertEqual(manager.get_task(t.task_id).state, TaskState.FAILED)
 
-    def test_task_manager_atomic_shortcut_operations(self):
+    def test_task_manager_waiting_resume_operations(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
         manager = TaskManager(store=store)
 
-        running = manager.create_task(session_id="s1", user_text="running")
-        self.assertTrue(manager.set_state(running.task_id, TaskState.RUNNING))
-        pending = manager.create_task(session_id="s1", user_text="pending")
-        self.assertEqual(pending.state, TaskState.PENDING)
+        task = manager.create_task(session_id="s1", user_text="waiting")
+        self.assertTrue(manager.set_state(task.task_id, TaskState.RUNNING))
+        self.assertTrue(
+            manager.set_waiting_input(
+                task.task_id,
+                waiting_for_input={"pending_step_id": "S1", "clarify_question": "请补充预算"},
+                task_snapshot={"nodes": []},
+                error={"code": "TASK_NEED_USER_INPUT", "message": "need input", "retryable": True},
+            )
+        )
 
-        cancel_target, cancelled = manager.cancel_current_task("s1")
-        self.assertTrue(cancelled)
-        self.assertIsNotNone(cancel_target)
-        self.assertEqual(cancel_target.task_id, running.task_id)
+        waiting_task = manager.get_waiting_task("s1")
+        self.assertIsNotNone(waiting_task)
+        self.assertEqual(waiting_task.task_id, task.task_id)
 
-        first = manager.create_task(session_id="s1", user_text="first")
-        self.assertTrue(manager.set_state(first.task_id, TaskState.FAILED, error={"code": "X"}))
-        second = manager.create_task(session_id="s1", user_text="second")
-        self.assertTrue(manager.set_state(second.task_id, TaskState.CANCELLED))
-
-        retry_target, retried = manager.retry_latest_task("s1")
-        self.assertTrue(retried)
-        self.assertIsNotNone(retry_target)
-        self.assertEqual(retry_target.task_id, second.task_id)
-        self.assertEqual(manager.get_task(second.task_id).state, TaskState.PENDING)
+        resumed_task, resumed_ok, payload = manager.resume_waiting_task(task.task_id, "预算200")
+        self.assertTrue(resumed_ok)
+        self.assertIsNotNone(resumed_task)
+        self.assertIsNotNone(payload)
+        self.assertEqual(resumed_task.state, TaskState.RUNNING)
 
     def test_trace_logger_async_write(self):
         trace_dir = self.temp_dir / "traces"
@@ -188,97 +177,6 @@ class TaskFlowRegressionTests(unittest.TestCase):
         content = trace_file.read_text(encoding="utf-8")
         self.assertIn("round_start", content)
         self.assertIn("round_end", content)
-
-    def test_task_shortcut_parse(self):
-        self.assertEqual(parse_task_shortcut("/cancel"), "cancel")
-        self.assertEqual(parse_task_shortcut(" /RETRY "), "retry")
-        self.assertIsNone(parse_task_shortcut("/unknown"))
-
-    def test_task_manager_get_current_task_prefers_running(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-
-        running = manager.create_task(session_id="s1", user_text="running task")
-        manager.set_state(running.task_id, TaskState.RUNNING)
-
-        manager.create_task(session_id="s1", user_text="new pending task")
-
-        current = manager.get_current_task("s1")
-        self.assertIsNotNone(current)
-        self.assertEqual(current.task_id, running.task_id)
-        self.assertEqual(current.state, TaskState.RUNNING)
-
-    def test_task_shortcut_cancel_current_task(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-        chat_agent = _FakeChatAgent()
-
-        task = manager.create_task(session_id="s1", user_text="to cancel")
-        manager.set_state(task.task_id, TaskState.RUNNING)
-
-        result = execute_task_shortcut(
-            user_text="/cancel",
-            session_id="s1",
-            history=[],
-            task_manager=manager,
-            chat_agent=chat_agent,
-        )
-        self.assertIsNotNone(result)
-        self.assertEqual(result.meta.get("task_command"), "cancel")
-        self.assertEqual(result.meta.get("task_id"), task.task_id)
-        self.assertEqual(manager.get_task(task.task_id).state, TaskState.CANCELLED)
-
-    def test_task_shortcut_cancel_waiting_task(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-        chat_agent = _FakeChatAgent()
-
-        task = manager.create_task(session_id="s1", user_text="waiting")
-        manager.set_state(task.task_id, TaskState.RUNNING)
-        manager.set_waiting_input(
-            task.task_id,
-            waiting_for_input={"pending_step_id": "S1", "clarify_question": "请补充预算"},
-            task_snapshot={"nodes": []},
-            error={"code": "TASK_NEED_USER_INPUT", "message": "need input", "retryable": True},
-        )
-
-        result = execute_task_shortcut(
-            user_text="/cancel",
-            session_id="s1",
-            history=[],
-            task_manager=manager,
-            chat_agent=chat_agent,
-        )
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.meta.get("task_command"), "cancel")
-        self.assertEqual(result.meta.get("task_id"), task.task_id)
-        self.assertEqual(manager.get_task(task.task_id).state, TaskState.CANCELLED)
-
-    def test_task_shortcut_retry_latest_retryable_task(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-        chat_agent = _FakeChatAgent()
-
-        first = manager.create_task(session_id="s1", user_text="first")
-        manager.set_state(first.task_id, TaskState.FAILED, error={"code": "X"})
-
-        second = manager.create_task(session_id="s1", user_text="second")
-        manager.set_state(second.task_id, TaskState.CANCELLED)
-
-        result = execute_task_shortcut(
-            user_text="/retry",
-            session_id="s1",
-            history=[],
-            task_manager=manager,
-            chat_agent=chat_agent,
-        )
-        self.assertIsNotNone(result)
-        self.assertEqual(result.meta.get("task_command"), "retry")
-        self.assertEqual(result.meta.get("task_id"), second.task_id)
-        retried = manager.get_task(second.task_id)
-        self.assertEqual(retried.state, TaskState.PENDING)
-        self.assertEqual(retried.step_results, [])
 
     def test_langgraph_runner_blocks_downstream_steps(self):
         store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
@@ -526,76 +424,6 @@ class TaskFlowRegressionTests(unittest.TestCase):
         self.assertEqual([item["step_id"] for item in result.step_results], ["S1", "S2", "S3"])
         # S1/S2 should run in the same batch; if auto-serialized, elapsed would be notably longer.
         self.assertLess(elapsed, 0.55)
-
-    def test_task_manager_race_cancel_vs_finalize_is_consistent(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-
-        for i in range(30):
-            task = manager.create_task(session_id="race", user_text=f"race-{i}")
-            self.assertTrue(manager.set_state(task.task_id, TaskState.RUNNING))
-
-            barrier = threading.Barrier(3)
-            results = {"cancel_ok": None, "succeed_ok": None}
-
-            def _cancel():
-                barrier.wait()
-                results["cancel_ok"] = manager.cancel_task(task.task_id)
-
-            def _finalize_success():
-                barrier.wait()
-                results["succeed_ok"] = manager.set_state(task.task_id, TaskState.SUCCEEDED)
-
-            t1 = threading.Thread(target=_cancel)
-            t2 = threading.Thread(target=_finalize_success)
-            t1.start()
-            t2.start()
-            barrier.wait()
-            t1.join()
-            t2.join()
-
-            final = manager.get_task(task.task_id)
-            self.assertIsNotNone(final)
-            self.assertIn(final.state, {TaskState.CANCELLED, TaskState.SUCCEEDED})
-
-            # Exactly one transition wins the race.
-            self.assertNotEqual(bool(results["cancel_ok"]), bool(results["succeed_ok"]))
-            if final.state == TaskState.CANCELLED:
-                self.assertTrue(results["cancel_ok"])
-                self.assertFalse(results["succeed_ok"])
-            else:
-                self.assertTrue(results["succeed_ok"])
-                self.assertFalse(results["cancel_ok"])
-
-    def test_task_manager_cancel_current_task_is_atomic_under_concurrency(self):
-        store = TaskStore(base_dir=str(self.temp_dir / "tasks"))
-        manager = TaskManager(store=store)
-
-        task = manager.create_task(session_id="s1", user_text="cancel concurrently")
-        self.assertTrue(manager.set_state(task.task_id, TaskState.RUNNING))
-
-        barrier = threading.Barrier(3)
-        outputs = []
-
-        def _cancel_once():
-            barrier.wait()
-            selected, ok = manager.cancel_current_task("s1")
-            outputs.append((selected.task_id if selected else None, ok))
-
-        t1 = threading.Thread(target=_cancel_once)
-        t2 = threading.Thread(target=_cancel_once)
-        t1.start()
-        t2.start()
-        barrier.wait()
-        t1.join()
-        t2.join()
-
-        self.assertEqual(len(outputs), 2)
-        self.assertEqual(sum(1 for _, ok in outputs if ok), 1)
-        self.assertEqual(sum(1 for task_id, _ in outputs if task_id == task.task_id), 1)
-        self.assertEqual(sum(1 for task_id, _ in outputs if task_id is None), 1)
-        self.assertEqual(manager.get_task(task.task_id).state, TaskState.CANCELLED)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,6 @@ STEP_STATE_READY = "ready"
 STEP_STATE_RUNNING = "running"
 STEP_STATE_SUCCEEDED = "succeeded"
 STEP_STATE_FAILED = "failed"
-STEP_STATE_CANCELLED = "cancelled"
 STEP_STATE_BLOCKED = "blocked"
 STEP_STATE_SKIPPED = "skipped"
 STEP_STATE_WAITING_USER_INPUT = "waiting_user_input"
@@ -26,13 +25,11 @@ STEP_STATE_WAITING_USER_INPUT = "waiting_user_input"
 TERMINAL_STATES = {
     STEP_STATE_SUCCEEDED,
     STEP_STATE_FAILED,
-    STEP_STATE_CANCELLED,
     STEP_STATE_BLOCKED,
     STEP_STATE_SKIPPED,
 }
 UPSTREAM_FAILED_STATES = {
     STEP_STATE_FAILED,
-    STEP_STATE_CANCELLED,
     STEP_STATE_BLOCKED,
 }
 
@@ -86,6 +83,8 @@ class LangGraphTaskRunner:
         task_manager: Any,
         build_step_input: Callable[..., str],
     ):
+        # task_manager 负责任务状态持久化；
+        # build_step_input 由 orchestrator 注入，用于将 step + 上下文组装成执行输入。
         self._task_manager = task_manager
         self._build_step_input = build_step_input
         self._graph = self._build_graph()
@@ -105,6 +104,16 @@ class LangGraphTaskRunner:
         resume_waiting_payload: Optional[Dict[str, Any]] = None,
         resume_user_reply: str = "",
     ) -> TaskFlowRunResult:
+        """
+        TaskRunner 对外统一入口。
+
+        调用方只需提供 user/session/task 与三类 agent：
+        1) planner_agent 负责产出计划；
+        2) executor_agent 负责执行步骤；
+        3) critic_agent 负责最终评审。
+
+        该方法会驱动 LangGraph 状态机直到 finalize，返回整轮执行快照。
+        """
         initial: TaskFlowState = {
             "user_text": user_text,
             "history": history,
@@ -129,6 +138,7 @@ class LangGraphTaskRunner:
         state = self._graph.invoke(initial)
         critic_result = state.get("critic_result")
         if critic_result is None:
+            # waiting 场景下无需强制评审；否则兜底 pass，保证返回结构稳定。
             if state.get("waiting_for_input"):
                 critic_result = CriticResult(quality="pass", summary="任务等待用户补充信息。")
             else:
@@ -147,6 +157,9 @@ class LangGraphTaskRunner:
         )
 
     def _build_graph(self):
+        # 固定节点：
+        # plan_task -> select_ready_steps -> run_ready_steps(循环) -> review_task -> finalize_task。
+        # 其中 select/run 之间通过 next_action 实现条件跳转。
         graph = StateGraph(TaskFlowState)
         graph.add_node("plan_task", self._plan_task)
         graph.add_node("select_ready_steps", self._select_ready_steps)
@@ -179,6 +192,7 @@ class LangGraphTaskRunner:
         return graph.compile()
 
     def _plan_task(self, state: TaskFlowState) -> TaskFlowState:
+        # resume 模式：优先复用已持久化 plan + snapshot，不重新规划。
         if state.get("resume_mode"):
             plan_result = state.get("resume_plan_result")
             snapshot = deepcopy(state.get("resume_snapshot") or {})
@@ -200,6 +214,7 @@ class LangGraphTaskRunner:
                 }
             else:
                 try:
+                    # 将 waiting 节点回退到 pending，并注入用户补充信息绑定。
                     self._prepare_resume_snapshot(
                         snapshot=snapshot,
                         waiting_payload=waiting_payload,
@@ -213,6 +228,7 @@ class LangGraphTaskRunner:
                         "retryable": True,
                     }
         else:
+            # 新任务模式：先向 planner 拿计划，再构建 DAG 快照。
             planner_agent = state["planner_agent"]
             plan_result = planner_agent.plan_task(
                 user_text=state["user_text"],
@@ -231,6 +247,7 @@ class LangGraphTaskRunner:
                 }
                 first_error = state.get("first_error")
             except Exception as exc:
+                # 计划不合法时保留错误并生成空图，后续流程可按失败路径收敛。
                 snapshot = {
                     "goal": plan_result.goal,
                     "policy": self._normalize_policy(plan_result.graph_policy),
@@ -245,6 +262,7 @@ class LangGraphTaskRunner:
 
             self._task_manager.set_plan(state["task_id"], plan_result.to_dict())
 
+        # 每轮 planning 完成都统一初始化后续调度状态。
         state["plan_result"] = plan_result
         state["task_snapshot"] = snapshot
         state["first_error"] = first_error
@@ -256,18 +274,7 @@ class LangGraphTaskRunner:
     def _select_ready_steps(self, state: TaskFlowState) -> TaskFlowState:
         # 读取当前任务图快照和任务ID：
         # - snapshot 保存了 nodes/policy/topological_order 等运行时状态
-        # - task_id 用于查询是否被用户取消（/cancel）
         snapshot = state["task_snapshot"]
-        task_id = state["task_id"]
-
-        # 分支1：任务已被取消
-        # 一旦检测到取消，就不再继续选择可执行步骤，而是：
-        # 1) 构造统一取消错误
-        # 2) 将尚未执行的 pending/ready 步骤全部标记为 cancelled
-        # 3) 仅在首错为空时写入 first_error（保持“第一条错误”语义）
-        # 4) 清空 ready_batch，路由到 review_task 做结果收敛
-        if self._is_task_cancelled(task_id):
-            return self._cancel_and_route_review(state=state, snapshot=snapshot)
 
         # 已进入等待用户输入态时，本轮直接收敛到 finalize，避免继续调度。
         if self._has_waiting_input(snapshot):
@@ -275,7 +282,7 @@ class LangGraphTaskRunner:
             state["next_action"] = ACTION_FINALIZE
             return state
 
-        # 分支2：任务未取消，尝试刷新并挑选 ready 节点
+        # 刷新并挑选 ready 节点
         # _refresh_ready_nodes 会根据依赖状态把节点从 pending 转成 ready 或 blocked
         self._refresh_ready_nodes(snapshot)
 
@@ -316,18 +323,13 @@ class LangGraphTaskRunner:
     def _run_ready_steps(self, state: TaskFlowState) -> TaskFlowState:
         # 读取本轮执行所需的核心上下文：
         # - snapshot: 当前任务图快照（包含所有节点状态与依赖）
-        # - task_id: 用于取消检查与任务结果落盘
+        # - task_id: 用于任务结果落盘
         # - executor_agent: 真正执行单步任务的代理
         # - fail_fast: 是否在出现首个步骤错误后阻断剩余未执行步骤
         snapshot = state["task_snapshot"]
         task_id = state["task_id"]
         executor_agent = state["executor_agent"]
         fail_fast = self._fail_fast(snapshot)
-
-        # 入口取消检查：
-        # 如果任务在进入执行节点前已经被取消，直接把剩余步骤标记为 cancelled 并路由到 review。
-        if self._is_task_cancelled(task_id):
-            return self._cancel_and_route_review(state=state, snapshot=snapshot)
 
         # 将本轮 ready 批次转换为待执行作业列表 jobs。
         # 每个作业保存 (step_id, step_input)：
@@ -411,16 +413,7 @@ class LangGraphTaskRunner:
 
         # 默认继续回到 select_ready_steps，挑选下一轮 ready 批次。
         next_action = ACTION_SELECT_STEPS
-        if self._is_task_cancelled(task_id):
-            # 出现“执行中取消”时，批次后收敛：
-            # - 将剩余 pending/ready 标记 cancelled
-            # - 记录首错（若为空）
-            # - 路由到 review 收尾
-            cancel_error = self._cancel_error()
-            self._mark_remaining_cancelled(snapshot, cancel_error)
-            self._set_first_error_once(state, cancel_error)
-            next_action = ACTION_REVIEW
-        elif waiting_payload is not None and state.get("first_error") is None:
+        if waiting_payload is not None and state.get("first_error") is None:
             state["waiting_for_input"] = waiting_payload
             next_action = ACTION_FINALIZE
         elif fail_fast_error is not None:
@@ -440,6 +433,7 @@ class LangGraphTaskRunner:
         return state
 
     def _review_task(self, state: TaskFlowState) -> TaskFlowState:
+        # 评审节点只消费当前执行图，不改变节点状态，仅产出质量结论。
         critic_agent = state["critic_agent"]
         critic_result = critic_agent.review_task(
             user_text=state["user_text"],
@@ -450,16 +444,16 @@ class LangGraphTaskRunner:
         return state
 
     def _finalize_task(self, state: TaskFlowState) -> TaskFlowState:
+        # finalize 是任务状态机与运行快照的收口点：
+        # 1) 持久化 task_snapshot；
+        # 2) 根据 waiting/first_error 写最终任务状态。
         task_id = state["task_id"]
         snapshot = state["task_snapshot"]
         self._task_manager.set_task_snapshot(task_id, snapshot)
 
-        task = self._task_manager.get_task(task_id)
-        if task and task.state == TaskState.CANCELLED:
-            return state
-
         waiting_for_input = state.get("waiting_for_input")
         if waiting_for_input:
+            # waiting 场景：任务进入 WAITING_USER_INPUT，可由下一轮用户输入恢复。
             waiting_error = {
                 "code": "TASK_NEED_USER_INPUT",
                 "message": str(waiting_for_input.get("summary") or "Task requires additional user input"),
@@ -473,6 +467,7 @@ class LangGraphTaskRunner:
             )
             return state
 
+        # 非 waiting：有首错 -> failed；否则 succeeded。
         if state.get("first_error"):
             self._task_manager.set_state(task_id, TaskState.FAILED, error=state["first_error"])
         else:
@@ -485,13 +480,6 @@ class LangGraphTaskRunner:
             return action
         return ACTION_REVIEW
 
-    def _cancel_error(self) -> Dict[str, Any]:
-        return {
-            "code": "TASK_CANCELLED",
-            "message": "Task cancelled by user",
-            "retryable": True,
-        }
-
     def _set_first_error_once(self, state: TaskFlowState, error: Optional[Dict[str, Any]]) -> None:
         if error is None:
             return
@@ -501,13 +489,6 @@ class LangGraphTaskRunner:
     def _route_to_review(self, state: TaskFlowState) -> None:
         state["ready_batch"] = []
         state["next_action"] = ACTION_REVIEW
-
-    def _cancel_and_route_review(self, *, state: TaskFlowState, snapshot: Dict[str, Any]) -> TaskFlowState:
-        cancel_error = self._cancel_error()
-        self._mark_remaining_cancelled(snapshot, cancel_error)
-        self._set_first_error_once(state, cancel_error)
-        self._route_to_review(state)
-        return state
 
     def _build_steps(self, plan_result: PlanResult) -> List[Dict[str, Any]]:
         steps: List[Dict[str, Any]] = []
@@ -612,12 +593,6 @@ class LangGraphTaskRunner:
             return nodes
         return nodes[: max(int(limit), 0)]
 
-    def _mark_remaining_cancelled(self, snapshot: Dict[str, Any], error: Optional[Dict[str, Any]]) -> None:
-        for node in snapshot["nodes"]:
-            if node.get("state") in {STEP_STATE_PENDING, STEP_STATE_READY, STEP_STATE_WAITING_USER_INPUT}:
-                node["state"] = STEP_STATE_CANCELLED
-                node["error"] = error
-
     def _mark_remaining_blocked(self, snapshot: Dict[str, Any], error: Optional[Dict[str, Any]]) -> None:
         for node in snapshot["nodes"]:
             if node.get("state") in {STEP_STATE_PENDING, STEP_STATE_READY}:
@@ -640,7 +615,7 @@ class LangGraphTaskRunner:
 
     def _refresh_ready_nodes(self, snapshot: Dict[str, Any]) -> None:
         """
-        对于所有的节点，检查它的依赖节点，只要有一个处于 FAILED/CANCELLED/BLOCKED，就把它标记为 BLOCKED；
+        对于所有的节点，检查它的依赖节点，只要有一个处于 FAILED/BLOCKED，就把它标记为 BLOCKED；
         如果全部依赖都成功了，就把它标记为 READY。
         相当于该节点入度为0了，可以开始调度
         """
@@ -688,10 +663,6 @@ class LangGraphTaskRunner:
             if str(node.get("step_id")) == step_id:
                 return node
         raise ValueError(f"Unknown step_id: {step_id}")
-
-    def _is_task_cancelled(self, task_id: str) -> bool:
-        task = self._task_manager.get_task(task_id)
-        return bool(task and task.state == TaskState.CANCELLED)
 
     def _run_step_batch(
         self,

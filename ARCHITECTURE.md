@@ -4,7 +4,7 @@
 Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 - 多智能体编排（chat/planner/executor/critic）
 - 工具基础设施分层（`core/tools`: BaseTool + ToolRegistry + built-in tools + web_search）
-- 任务生命周期管理（create/cancel/retry）
+- 任务生命周期管理（create + state persistence + waiting resume）
 - LangGraph 任务编排链路（planner -> langgraph runner -> executor/critic）
 - 本地记忆系统（Memory OS Lite，含可选向量检索）
 - LLM 调用基础层（`core/llm`: client 工厂 + chat 调用服务 + 翻译引擎）
@@ -39,10 +39,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 `core/orchestrator/orchestrator.py` 新能力：
 1. 每轮请求前：注入记忆上下文到 agent history（个性化与连续性）
 2. 每轮请求后：自动沉淀记忆（偏好、待办、会话主题摘要、流程经验）
-3. 任务快捷指令：
-   - `/cancel`
-   - `/retry`
-4. 对外统一公共接口：
+3. 对外统一公共接口：
    - `handle_user_message(user_text, session_id)`
    - `record_session_round(session_id, user_text, assistant_reply, metadata)`
    - `close()`
@@ -52,7 +49,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 1. WS 收到用户消息并做 JSON + 字段契约校验（坏消息返回错误并继续会话）
 2. `service` 调用 `orchestrator.handle_user_message(...)`（不显式传递 history）
 3. orchestrator 通过 `MemoryService.get_recent_history` + `build_context` 组装上下文
-4. orchestrator 处理任务快捷指令；其余请求执行 chat/task 路由
+4. orchestrator 优先处理 waiting 任务恢复；其余请求执行 chat/task 路由
 5. task 模式下由 `LangGraphTaskRunner` 依据 `depends_on` / `input_bindings` / `graph_policy` 调度执行，`TaskManager` 持续跟踪状态
    - 若某一步返回“需补充信息”，任务进入 `waiting_user_input`，对外返回追问信息并暂停后续步骤
    - 用户补充后在同一 `task_id` 上恢复执行，不重新创建任务
@@ -109,8 +106,8 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
   - 降级场景（fallback）必须保留可观测事件，不静默吞错。
 
 ## 6. 协议与状态
-- `TaskState`: `pending/running/waiting_user_input/succeeded/failed/cancelled`
-- `StepState`: `pending/ready/running/succeeded/failed/cancelled/blocked/skipped`
+- `TaskState`: `pending/running/waiting_user_input/succeeded/failed`
+- `StepState`: `pending/ready/running/succeeded/failed/blocked/skipped`
 - `OrchestrationResult`: 兼容原接口，包含 `intent/final_reply/executor_result/meta`
 - 错误码体系统一由 `core/utils/errors.py` 管理
 
@@ -179,14 +176,14 @@ Client
 | 模块 | 输入 | 处理 | 输出 |
 |---|---|---|---|
 | `websocket_handler` / `handle_bot_reply` | WS JSON：`{"content": "..."} ` | 校验请求契约（JSON object + `content:str`）；坏消息返回 `error` 并继续会话；调用 orchestrator 公共接口，不显式维护 history 列表 | `orchestrated.final_reply` + 流式音频输出 |
-| `Orchestrator.handle_user_message` | `user_text`, `session_id` | 判断任务快捷指令或进入 chat/task 路由；从 memory 读取短期 history，注入长期上下文并执行多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
+| `Orchestrator.handle_user_message` | `user_text`, `session_id` | 优先恢复 waiting task，否则进入 chat/task 路由；从 memory 读取短期 history，注入长期上下文并执行多 agent 协作 | `OrchestrationResult(intent, final_reply, executor_result, meta)` |
 | `MemoryService.build_context` | `query` | 拉取 profile/commitment/relevant；启用向量时做 hybrid 检索并回退兜底 | 可注入 history 的 memory context 文本 |
 | `MemoryService.get_recent_history` / `record_session_round` | `session_id`, 回合消息 | 读取/写入短期会话历史（`ShortTermMemoryStore` 持久化） | recent history / session snapshot |
 | `HybridMemoryRetriever.search`（可选） | `query`, `limit`, `memory_types` | 关键词召回 + 向量召回，按综合分重排（vector/keyword/recency/type） | 相关记忆列表（TopK） |
 | `ChatCompletionService` / `BaseLLMAgent` / `JSONParseMixin` | agent 消息与模型原始输出 | `core/llm` 统一 client 初始化与 chat 调用（同步/流式），agent 侧复用调用与 JSON 清洗解析 | 降低各 agent 重复实现和解析偏差 |
 | `core/tools` (`BaseTool/ToolRegistry`) | tool schema + tool args + tool context | 统一工具抽象、注册、调用和错误归一化 | 标准化 `ToolResult` + callable tool schemas |
 | `PlannerAgent` | 任务请求 + 历史上下文 | 拆解执行步骤，输出 `steps + depends_on + input_bindings + graph_policy` | `PlanResult(goal, steps, graph_policy)` |
-| `LangGraphTaskRunner` | `task_id`, `plan`, `history`, `graph_policy` | 在 LangGraph 状态图内完成 ready 选择、步骤执行、失败阻断、取消检测和评审收敛 | `task_snapshot + step_results + first_error` |
+| `LangGraphTaskRunner` | `task_id`, `plan`, `history`, `graph_policy` | 在 LangGraph 状态图内完成 ready 选择、步骤执行、失败阻断和评审收敛 | `task_snapshot + step_results + first_error` |
 | `ExecutorAgent` | 单步任务输入 + 工具上下文 | 单通道 ReAct：模型按需决定工具调用，最终以 JSON 归一化后输出可读文本 | `ExecutorRunResult(output_text, tool_events, error)` |
 | `CriticAgent` | `user_text`, `plan`, `execution_graph` | 质量评审，给出 `pass/revise` 与建议 | `CriticResult` |
 | `ChatAgent.reply_with_task_result` | 用户请求 + 执行总结 + history | 组织最终可读回复，补齐情绪 JSON 格式 | 最终回复文本（首行情绪 JSON） |

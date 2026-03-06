@@ -14,7 +14,6 @@ class TaskState(str, Enum):
     WAITING_USER_INPUT = "waiting_user_input"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 @dataclass
