@@ -36,6 +36,10 @@ class PlannerAgentTests(unittest.TestCase):
         self.assertIn("【输出示例】", agent.captured_system_prompt)
         self.assertIn("步骤数必须为 2-5", agent.captured_system_prompt)
         self.assertIn("max_parallelism: 正整数，建议 1-2", agent.captured_system_prompt)
+        self.assertIn("自然语序，不等于依赖关系", agent.captured_system_prompt)
+        self.assertIn("可独立完成的子任务（如机票搜索与酒店搜索）", agent.captured_system_prompt)
+        self.assertIn("仅在当前步骤确实要消费上游字段时填写 input_bindings", agent.captured_system_prompt)
+        self.assertIn("优先并行规划", agent.captured_system_prompt)
 
     def test_plan_task_fallback_when_output_is_not_json(self):
         agent = _PlannerAgentStub("not json")

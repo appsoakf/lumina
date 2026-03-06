@@ -50,7 +50,7 @@ Lumina 是一个本地部署的实时 AI 语音助手框架。当前已实现：
 2. `service` 调用 `orchestrator.handle_user_message(...)`（不显式传递 history）
 3. orchestrator 通过 `MemoryService.get_recent_history` + `build_context` 组装上下文
 4. orchestrator 优先处理 waiting 任务恢复；其余请求执行 chat/task 路由
-5. task 模式下由 `LangGraphTaskRunner` 依据 `depends_on` / `input_bindings` / `graph_policy` 调度执行，`TaskManager` 持续跟踪状态
+5. task 模式下由 `PlannerAgent` 直接产出计划，`LangGraphTaskRunner` 依据 `depends_on` / `input_bindings` / `graph_policy` 调度执行，`TaskManager` 持续跟踪状态
    - 若某一步返回“需补充信息”，任务进入 `waiting_user_input`，对外返回追问信息并暂停后续步骤
    - 用户补充后在同一 `task_id` 上恢复执行，不重新创建任务
    - 对可重试失败触发有界 replan 循环；超出预算返回 `TASK_NOT_CONVERGED`
