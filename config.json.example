@@ -1,0 +1,88 @@
+{
+    "llm": {
+        "chat_model": "Qwen/Qwen3-8B",
+        "chat_api_url": "https://api.siliconflow.cn/v1",
+        "chat_api_key": "${LUMINA_API_KEY}",
+        "translate_model": "Qwen/Qwen3-8B",
+        "translate_api_url": "https://api.siliconflow.cn/v1",
+        "translate_api_key": "${LUMINA_API_KEY}",
+        "chat_prompt": "你的名字叫达克尼斯。你平时待人温和，是一位大小姐。你称对方为主人，并且绝不提及自己是AI或程序。只用中文回复。\\n\\n输出格式要求：\\n第一行必须是一个JSON对象，表示当前情绪：{\\\"emotion\\\": \\\"情绪\\\", \\\"intensity\\\": N}\\n第二行开始是正常的回复文本。\\n\\n情绪可选值：愤怒 | 平静 | 自信 | 失落 | 怀疑 | 兴奋 | 开心 | 严肃 | 害羞\\n强度取值：1（弱）| 2（中）| 3（强）\\n\\n规则：\\n- 情绪JSON必须在第一行，后面紧跟回复文本\\n- 不要把文本放在JSON里\\n- 情感选择要基于上下文和角色",
+        "translate_prompt": "将以下中文翻译成日文，只输出日文，不要任何解释："
+    },
+    "tts": {
+        "gpt_sovits_url": "http://127.0.0.1:6006",
+        "ref_path": "ref_audios/calm.wav",
+        "prompt_text": "カフェインはカプセルで摂取すれば良いのではないかしら？",
+        "prompt_lang": "ja"
+    },
+    "service": {
+        "pet_name": "darkness",
+        "username": "kazuma",
+        "server_address": "0.0.0.0",
+        "server_port": 8080,
+        "enable_translation": false,
+        "enable_tts": false
+    },
+    "logging": {
+        "level": "INFO",
+        "format": "both",
+        "log_dir": "logs",
+        "log_file_name": "lumina.log",
+        "event_file_name": "events.jsonl",
+        "enable_console": true,
+        "enable_file": true,
+        "enable_event_file": true,
+        "slow_threshold_ms": 1000,
+        "redact_user_text": true,
+        "user_text_preview_chars": 120
+    },
+    "tools": {
+        "web_search": {
+            "timeout_sec": 8,
+            "max_top_k": 5,
+            "uapis": {
+                "endpoint": "https://uapis.cn/api/v1/search/aggregate",
+                "api_key": "${UAPIS_API_KEY}",
+                "default_sort": "relevance",
+                "default_fetch_full": false
+            }
+        },
+        "file_io": {
+            "enabled": true,
+            "allow_any_absolute_path": true,
+            "allowed_roots": [
+                "$PROJECT",
+                "$RUNTIME"
+            ],
+            "allowed_read_exts": [
+                ".txt",
+                ".md",
+                ".json",
+                ".yaml",
+                ".yml",
+                ".csv",
+                ".log",
+                ".py",
+                ".pdf"
+            ],
+            "allowed_write_exts": [
+                ".md"
+            ],
+            "max_file_bytes": 2097152,
+            "max_chars": 12000,
+            "max_pdf_pages": 20,
+            "default_encoding": "utf-8"
+        }
+    },
+    "memory_vector": {
+        "enabled": false,
+        "embedding_model": "text-embedding-3-small",
+        "embedding_api_url": "https://api.siliconflow.cn/v1",
+        "embedding_api_key": "${LUMINA_EMBEDDING_API_KEY}",
+        "vector_dim": 1536
+    },
+    "task_flow": {
+        "max_replan_rounds": 2,
+        "max_clarify_rounds": 3
+    }
+}

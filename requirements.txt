@@ -5,3 +5,4 @@ openai
 requests
 pydantic
 qdrant-client
+numpy

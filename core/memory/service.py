@@ -1,77 +1,177 @@
+import json
 import logging
+import math
+import re
+import threading
 import time
+from datetime import datetime
 from hashlib import sha1
 from typing import Dict, List, Optional
 
-from core.config import load_app_config
-from core.memory.embedding import OpenAIEmbeddingProvider
-from core.memory.hybrid_retriever import HybridMemoryRetriever
-from core.memory.indexer import MemoryVectorIndexer
-from core.memory.ingestor import MemoryIngestor
-from core.memory.models import MemoryRecord, MemoryType
-from core.memory.policy import MemoryPolicy
-from core.memory.retriever import MemoryRetriever
-from core.memory.short_term_store import ShortTermMemoryStore
-from core.memory.store import LongTermMemoryStore
-from core.memory.turn_summarizer import AsyncTurnSummarizer, TurnSummary, TurnSummaryExtractor
-from core.memory.vector_store import QdrantVectorStore
+from core.config import MemoryVectorConfig, load_app_config
+from core.memory.memory_module_engine import Memory as EngineMemory
+from core.memory.memory_module_engine import OpenAIEmbedding
+from core.memory.memory_module_engine.embedding import EmbeddingProvider as EngineEmbeddingProvider
+from core.memory.memory_module_engine.models import MemoryItem
+from core.paths import runtime_memory_dir, runtime_sessions_dir
 from core.utils import log_exception
 
 logger = logging.getLogger(__name__)
 
 
+class DeterministicEmbeddingProvider(EngineEmbeddingProvider):
+    """Local deterministic embedding provider for offline-safe memory operations."""
+
+    def __init__(self, dim: int = 384):
+        self._dim = max(int(dim), 64)
+
+    def encode(self, text: str) -> List[float]:
+        vec = [0.0] * self._dim
+        source = (text or "").strip().lower()
+        if not source:
+            return vec
+        for idx, ch in enumerate(source):
+            slot = idx % self._dim
+            vec[slot] += ((ord(ch) % 97) + 1) / 97.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    def get_dimension(self) -> int:
+        return self._dim
+
+
 class MemoryService:
     """Unified memory gateway for orchestrator and agents."""
 
+    # 轻量规则：用于把输入映射为结构化记忆标签。
+    PROFILE_PATTERNS = [
+        re.compile(r"我喜欢(.+)$"),
+        re.compile(r"我不喜欢(.+)$"),
+        re.compile(r"我的偏好(?:是)?(.+)$"),
+        re.compile(r"我偏好(.+)$"),
+        re.compile(r"我习惯(.+)$"),
+    ]
+    COMMITMENT_PATTERNS = [
+        re.compile(r"(?:提醒我|记得|待办[:：]?)(.+)$"),
+        re.compile(r"(.+?)(?:截止|在)(\d{1,2}月\d{1,2}日|\d{4}[/-]\d{1,2}[/-]\d{1,2})"),
+    ]
+    LIST_SPLIT_RE = re.compile(r"[、,，]|和|以及")
+    TOPIC_SPLIT_RE = re.compile(r"[。！？!?;\n]")
+
+    DEDUPE_WINDOW_SECONDS = {
+        "profile": 90 * 24 * 3600,
+        "commitment": 24 * 3600,
+        "episodic": 2 * 3600,
+        "procedural": 7 * 24 * 3600,
+    }
+
     def __init__(
         self,
-        long_term_store: Optional[LongTermMemoryStore] = None,
-        policy: Optional[MemoryPolicy] = None,
-        ingestor: Optional[MemoryIngestor] = None,
-        short_term_store: Optional[ShortTermMemoryStore] = None,
-        turn_summary_extractor: Optional[TurnSummaryExtractor] = None,
-        turn_summarizer: Optional[AsyncTurnSummarizer] = None,
         short_history_limit: int = 24,
         default_user_id: str = "default",
     ):
-        self.long_term_store = long_term_store or LongTermMemoryStore()
-        self.policy = policy or MemoryPolicy()
-        self.ingestor = ingestor or MemoryIngestor()
-        self.retriever = MemoryRetriever(self.long_term_store)
-        self.short_term_store = short_term_store or ShortTermMemoryStore()
         self.short_history_limit = max(int(short_history_limit), 0)
         self.default_user_id = default_user_id
-        self._last_cleanup_ts = 0.0
 
         self.vector_cfg = load_app_config().memory_vector
-        self.embedder = OpenAIEmbeddingProvider(self.vector_cfg)
-        self.vector_store = QdrantVectorStore(self.vector_cfg)
-        self.hybrid_retriever = HybridMemoryRetriever(
-            keyword_retriever=self.retriever,
-            store=self.long_term_store,
-            embedder=self.embedder,
-            vector_store=self.vector_store,
-            cfg=self.vector_cfg,
+        self._dedupe_lock = threading.RLock()
+        self._session_lock = threading.RLock()
+        self._recent_hashes: Dict[str, float] = {}
+
+        self._session_dir = runtime_sessions_dir()
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        self._engine = self._build_engine(self.vector_cfg)
+
+    def _build_engine(self, vector_cfg: MemoryVectorConfig) -> EngineMemory:
+        storage_dir = runtime_memory_dir() / "memory_module"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+
+        embedder = self._build_embedder(vector_cfg)
+        # 运行默认关闭 LLM 抽取，避免主链路强依赖外网。
+        overrides = {"llm_enabled": False}
+        return EngineMemory(
+            storage_path=str(storage_dir),
+            embedding_provider=embedder,
+            auto_consolidate=True,
+            config_overrides=overrides,
         )
-        self.vector_indexer = MemoryVectorIndexer(
-            embedder=self.embedder,
-            vector_store=self.vector_store,
-            enabled=self.vector_cfg.enabled and self.vector_cfg.write_async,
-            queue_size=self.vector_cfg.queue_size,
-            max_retries=self.vector_cfg.max_retries,
-        )
-        self.turn_summary_extractor = turn_summary_extractor or TurnSummaryExtractor(ingestor=self.ingestor)
-        self.turn_summarizer = turn_summarizer or AsyncTurnSummarizer(
-            extractor=self.turn_summary_extractor,
-            on_summary=self._persist_turn_summary,
-            enabled=True,
-            queue_size=256,
-        )
+
+    def _build_embedder(self, vector_cfg: MemoryVectorConfig) -> EngineEmbeddingProvider:
+        api_key = (vector_cfg.embedding_api_key or "").strip()
+        use_openai = bool(vector_cfg.enabled and api_key)
+        if use_openai:
+            try:
+                return OpenAIEmbedding(
+                    api_key=api_key,
+                    model=vector_cfg.embedding_model,
+                    dimensions=max(int(vector_cfg.vector_dim), 64),
+                    base_url=vector_cfg.embedding_api_url or None,
+                    cache_enabled=True,
+                    cache_max_entries=4096,
+                )
+            except Exception:
+                log_exception(
+                    logger,
+                    "memory.embedder.init.error",
+                    "OpenAI embedding 初始化失败，回退本地确定性 embedding",
+                    component="memory",
+                    fallback="deterministic_embedding",
+                )
+        return DeterministicEmbeddingProvider(dim=max(int(vector_cfg.vector_dim), 384))
+
+    def _safe_session_id(self, session_id: str) -> str:
+        raw = str(session_id or "default").strip() or "default"
+        return re.sub(r"[^A-Za-z0-9._-]", "_", raw)
+
+    def _session_path(self, session_id: str):
+        safe = self._safe_session_id(session_id)
+        return self._session_dir / f"{safe}.json"
+
+    def _load_round(self, session_id: str) -> Dict[str, object]:
+        path = self._session_path(session_id)
+        if not path.exists():
+            return {"session_id": self._safe_session_id(session_id), "history": [], "metadata": {}}
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            history = data.get("history")
+            metadata = data.get("metadata")
+            return {
+                "session_id": data.get("session_id", self._safe_session_id(session_id)),
+                "saved_at": data.get("saved_at", ""),
+                "history": history if isinstance(history, list) else [],
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
+        except Exception:
+            return {"session_id": self._safe_session_id(session_id), "history": [], "metadata": {}}
+
+    def _save_round(self, session_id: str, history: List[Dict[str, object]], metadata: Dict[str, object]) -> None:
+        path = self._session_path(session_id)
+        payload = {
+            "session_id": self._safe_session_id(session_id),
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "history": history,
+            "metadata": metadata,
+        }
+        temp_path = str(path) + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        # 原子替换，避免并发写入导致半文件状态。
+        import os
+
+        os.replace(temp_path, path)
 
     def get_recent_history(self, session_id: str, limit_messages: Optional[int] = None) -> List[Dict[str, str]]:
         limit = self.short_history_limit if limit_messages is None else limit_messages
-        rows = self.short_term_store.load_history(session_id=session_id, limit_messages=limit)
-        history: List[Dict[str, str]] = []
+        with self._session_lock:
+            payload = self._load_round(session_id)
+        history = payload.get("history")
+        if not isinstance(history, list):
+            return []
+
+        rows = history[-limit:] if isinstance(limit, int) and limit > 0 else history
+        out: List[Dict[str, str]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -79,8 +179,8 @@ class MemoryService:
             content = str(row.get("content", ""))
             if not role:
                 continue
-            history.append({"role": role, "content": content})
-        return history
+            out.append({"role": role, "content": content})
+        return out
 
     def record_session_round(
         self,
@@ -89,50 +189,15 @@ class MemoryService:
         assistant_reply: str,
         metadata: Optional[Dict[str, object]] = None,
     ) -> List[Dict[str, str]]:
-        history = self.short_term_store.load_history(session_id=session_id, limit_messages=None)
-        if user_text.strip():
-            history.append({"role": "user", "content": user_text})
-        if assistant_reply.strip():
-            history.append({"role": "assistant", "content": assistant_reply})
-        self.short_term_store.save_round(session_id=session_id, history=history, metadata=metadata or {})
+        with self._session_lock:
+            payload = self._load_round(session_id)
+            history = payload.get("history") if isinstance(payload.get("history"), list) else []
+            if (user_text or "").strip():
+                history.append({"role": "user", "content": str(user_text)})
+            if (assistant_reply or "").strip():
+                history.append({"role": "assistant", "content": str(assistant_reply)})
+            self._save_round(session_id, history, metadata or {})
         return self.get_recent_history(session_id=session_id, limit_messages=None)
-
-    def build_context(self, query: str = "") -> str:
-        self._maybe_cleanup()
-        profile = self.retriever.get_profile(limit=4)
-        commitments = self.retriever.get_open_commitments(limit=4)
-        if self.vector_cfg.enabled:
-            relevant = self.hybrid_retriever.search(
-                query=query,
-                limit=4,
-                memory_types=[
-                    MemoryType.EPISODIC.value,
-                    MemoryType.PROCEDURAL.value,
-                    MemoryType.ARTIFACT.value,
-                ],
-            )
-        else:
-            relevant = self.retriever.search_relevant(query=query, limit=4)
-
-        lines = []
-        if profile:
-            lines.append("用户偏好:")
-            for p in profile:
-                lines.append(f"- {p.get('content')}")
-
-        if commitments:
-            lines.append("未完成事项:")
-            for c in commitments:
-                due = (c.get("payload") or {}).get("due", "")
-                suffix = f" (截止:{due})" if due else ""
-                lines.append(f"- #{c.get('memory_id')} {c.get('content')}{suffix}")
-
-        if relevant:
-            lines.append("相关历史:")
-            for r in self._dedupe_rows(relevant):
-                lines.append(f"- {r.get('content')}")
-
-        return "\n".join(lines).strip()
 
     def ingest_turn(
         self,
@@ -141,234 +206,237 @@ class MemoryService:
         assistant_reply: str,
         meta: Optional[Dict] = None,
     ) -> None:
-        self._maybe_cleanup()
+        user_text = str(user_text or "").strip()
+        assistant_reply = str(assistant_reply or "").strip()
+        meta = meta if isinstance(meta, dict) else {}
 
-        turn_item = self._build_turn_summary_item(
-            session_id=session_id,
-            user_text=user_text,
-            assistant_reply=assistant_reply,
-            meta=meta,
-        )
-        if not self.turn_summarizer.enqueue(turn_item):
-            summary = self.turn_summary_extractor.summarize(user_text=user_text, assistant_reply=assistant_reply)
-            self._persist_turn_summary(summary, turn_item)
+        # 1) 结构化偏好与待办。
+        for profile in self._extract_profile_candidates(user_text):
+            self._persist_memory("profile", profile)
 
-        # commitment memory
-        if self.policy.should_store_commitment(user_text):
-            for c in self.ingestor.extract_commitment_candidates(user_text):
-                rec = MemoryRecord(
-                    memory_id=None,
-                    user_id=self.default_user_id,
-                    session_id=session_id,
-                    memory_type=MemoryType.COMMITMENT,
-                    content=c["content"],
-                    tags=c.get("tags", "commitment"),
-                    ttl_seconds=self.policy.default_ttl_seconds(MemoryType.COMMITMENT),
-                    source="user_utterance",
-                    payload=c.get("payload", {}),
-                )
-                self._add_if_not_duplicate(rec)
+        for commitment in self._extract_commitment_candidates(user_text):
+            self._persist_memory("commitment", commitment)
 
-        # procedural capture for successful tasks
-        if meta and meta.get("task_mode") and meta.get("task_id") and not meta.get("task_error"):
+        # 2) 对话片段。
+        if len(user_text) >= 6:
+            topic = self._extract_topic(user_text=user_text, assistant_reply=assistant_reply)
+            episodic = f"主题:{topic} | USER:{user_text[:120]} | ASSISTANT:{assistant_reply[:120]}"
+            self._persist_memory("episodic", episodic)
+
+        # 3) 任务经验。
+        if meta.get("task_mode") and meta.get("task_id") and not meta.get("task_error"):
             plan = meta.get("plan")
-            if plan:
-                rec = MemoryRecord(
-                    memory_id=None,
-                    user_id=self.default_user_id,
-                    session_id=session_id,
-                    memory_type=MemoryType.PROCEDURAL,
-                    content=f"任务模板: {plan.get('goal', '')}",
-                    tags="procedural,task_template",
-                    source="task_summary",
-                    payload={"plan": plan},
-                )
-                self._add_if_not_duplicate(rec)
+            if isinstance(plan, dict):
+                goal = str(plan.get("goal", "")).strip()
+                if goal:
+                    self._persist_memory("procedural", f"任务模板: {goal}")
 
-    def _build_turn_summary_item(
-        self,
-        session_id: str,
-        user_text: str,
-        assistant_reply: str,
-        meta: Optional[Dict],
-    ) -> Dict[str, object]:
-        return {
-            "session_id": session_id,
-            "user_text": user_text or "",
-            "assistant_reply": assistant_reply or "",
-            "meta": meta or {},
-        }
+    def build_context(self, query: str = "") -> str:
+        query_text = str(query or "").strip()
+        profile_rows = self._prefixed_entries(
+            query=(f"{query_text} 偏好 喜欢 习惯 profile".strip()),
+            prefix="profile",
+            limit=4,
+        )
+        commitment_rows = self._prefixed_entries(
+            query=(f"{query_text} 待办 提醒 截止 commitment".strip()),
+            prefix="commitment",
+            limit=4,
+        )
+        relevant_rows = self._search_entries(query=query_text or "最近对话", limit=8)
 
-    def _persist_turn_summary(self, summary: TurnSummary, item: Dict[str, object]) -> None:
+        covered_ids = {item.id for item in profile_rows}
+        covered_ids.update(item.id for item in commitment_rows)
+        relevant_rows = [item for item in relevant_rows if item.id not in covered_ids]
+
+        lines: List[str] = []
+        if profile_rows:
+            lines.append("用户偏好:")
+            for item in profile_rows:
+                lines.append(f"- {self._strip_prefix(item.content, 'profile')}")
+
+        if commitment_rows:
+            lines.append("未完成事项:")
+            for item in commitment_rows:
+                lines.append(f"- {self._strip_prefix(item.content, 'commitment')}")
+
+        if relevant_rows:
+            lines.append("相关历史:")
+            for item in relevant_rows[:6]:
+                lines.append(f"- {self._strip_prefix(item.content, 'episodic')}")
+
+        return "\n".join(lines).strip()
+
+    def _persist_memory(self, memory_type: str, content: str) -> str:
+        normalized = str(content or "").strip()
+        if not normalized:
+            return ""
+        full_text = f"{memory_type}: {normalized}"
+        if self._is_recent_duplicate(memory_type, full_text):
+            return ""
         try:
-            self._maybe_cleanup()
-            session_id = str(item.get("session_id", "")).strip()
-            user_text = str(item.get("user_text", ""))
-            assistant_reply = str(item.get("assistant_reply", ""))
-            meta_obj = item.get("meta")
-            meta = meta_obj if isinstance(meta_obj, dict) else {}
-
-            self._persist_profile_candidates(
-                session_id=session_id,
-                candidates=summary.profile_candidates,
-                meta=meta,
-                topic=summary.topic,
-            )
-            self._persist_topic_summary(
-                session_id=session_id,
-                user_text=user_text,
-                assistant_reply=assistant_reply,
-                topic=summary.topic,
-                meta=meta,
-            )
+            return self._engine.add(full_text)
         except Exception:
             log_exception(
                 logger,
-                "memory.turn_summary.persist.error",
-                "Turn summary 落盘失败，已跳过本次写入",
+                "memory.engine.add.error",
+                "memory_module 写入失败，已跳过该条记忆",
                 component="memory",
+                fallback="skip_memory_write",
             )
+            return ""
 
-    def _persist_profile_candidates(
-        self,
-        session_id: str,
-        candidates: List[str],
-        meta: Dict,
-        topic: str,
-    ) -> None:
-        for value in candidates:
-            content = str(value).strip()
-            if not content:
-                continue
-            rec = MemoryRecord(
-                memory_id=None,
-                user_id=self.default_user_id,
-                session_id=session_id,
-                memory_type=MemoryType.PROFILE,
-                content=content,
-                tags="profile,preference,auto",
-                ttl_seconds=self.policy.default_ttl_seconds(MemoryType.PROFILE),
-                source="turn_summary",
-                payload={"meta": meta, "topic": topic},
-            )
-            self._add_if_not_duplicate(rec)
+    def _hash_content(self, memory_type: str, text: str) -> str:
+        normalized = " ".join(str(text or "").strip().lower().split())
+        return sha1(f"{memory_type}:{normalized}".encode("utf-8")).hexdigest()
 
-    def _persist_topic_summary(
-        self,
-        session_id: str,
-        user_text: str,
-        assistant_reply: str,
-        topic: str,
-        meta: Dict,
-    ) -> None:
-        if not self.policy.should_store_episode(user_text):
-            return
-
-        topic_text = (topic or "").strip() or "本轮对话"
-        content = f"主题:{topic_text} | USER:{user_text[:120]} | ASSISTANT:{assistant_reply[:120]}"
-        rec = MemoryRecord(
-            memory_id=None,
-            user_id=self.default_user_id,
-            session_id=session_id,
-            memory_type=MemoryType.EPISODIC,
-            content=content,
-            tags="episodic,topic,turn",
-            ttl_seconds=self.policy.default_ttl_seconds(MemoryType.EPISODIC),
-            source="turn_summary",
-            payload={"meta": meta, "topic": topic_text},
-        )
-        self._add_if_not_duplicate(rec)
-
-    def cleanup_expired(self) -> int:
-        expired_ids = self.long_term_store.purge_expired_ids()
-        self._delete_vector_points(expired_ids)
-        return len(expired_ids)
-
-    def _maybe_cleanup(self) -> None:
+    def _is_recent_duplicate(self, memory_type: str, content: str) -> bool:
+        content_hash = self._hash_content(memory_type, content)
+        key = f"{memory_type}:{content_hash}"
         now = time.time()
-        interval = max(self.policy.cleanup_interval_seconds(), 30)
-        if now - self._last_cleanup_ts < interval:
-            return
-        self._last_cleanup_ts = now
-        expired_ids = self.long_term_store.purge_expired_ids()
-        self._delete_vector_points(expired_ids)
+        window = int(self.DEDUPE_WINDOW_SECONDS.get(memory_type, 24 * 3600))
 
-    def _normalize(self, text: str) -> str:
-        return " ".join((text or "").strip().lower().split())
+        with self._dedupe_lock:
+            last = self._recent_hashes.get(key)
+            self._recent_hashes[key] = now
 
-    def _hash_content(self, memory_type: MemoryType, text: str) -> str:
-        normalized = self._normalize(text)
-        return sha1(f"{memory_type.value}:{normalized}".encode("utf-8")).hexdigest()
+            # 控制 map 尺寸并清理过旧 key。
+            if len(self._recent_hashes) > 4096:
+                cutoff = now - max(window, 3600)
+                stale_keys = [k for k, ts in self._recent_hashes.items() if ts < cutoff]
+                for stale in stale_keys:
+                    self._recent_hashes.pop(stale, None)
 
-    def _add_if_not_duplicate(self, rec: MemoryRecord) -> int:
-        rec.content_hash = self._hash_content(rec.memory_type, rec.content)
-        window = self.policy.dedupe_window_seconds(rec.memory_type)
-        existing_id = self.long_term_store.find_recent_duplicate_id(
-            memory_type=rec.memory_type,
-            content_hash=rec.content_hash,
-            window_seconds=window,
-        )
-        if existing_id is not None:
-            # Idempotent write path: return existing id for stable behavior.
-            return existing_id
-        memory_id = self.long_term_store.add(rec)
-        self._index_memory(memory_id, rec)
-        return memory_id
+        return last is not None and (now - last) <= window
 
-    def _index_memory(self, memory_id: int, rec: MemoryRecord) -> None:
-        if not self.vector_cfg.enabled:
-            return
+    def _search_entries(self, query: str, limit: int) -> List[MemoryItem]:
+        try:
+            rows = self._engine.search(query=query, top_k=max(int(limit), 1))
+        except Exception:
+            log_exception(
+                logger,
+                "memory.engine.search.error",
+                "memory_module 检索失败，返回空结果",
+                component="memory",
+                fallback="empty_context",
+            )
+            return []
 
-        payload = {
-            "memory_type": rec.memory_type.value,
-            "tags": rec.tags,
-            "created_at": rec.created_at,
-            "ttl_seconds": rec.ttl_seconds,
-            "source": rec.source,
-            "content_hash": rec.content_hash,
-        }
-
-        if self.vector_cfg.write_async and self.vector_indexer.is_enabled():
-            self.vector_indexer.enqueue(memory_id=memory_id, content=rec.content, payload=payload)
-            return
-
-        vector = self.embedder.embed(rec.content)
-        if not vector:
-            return
-        self.vector_store.upsert(memory_id=memory_id, vector=vector, payload=payload)
-
-    def _delete_vector_points(self, memory_ids: List[int]) -> None:
-        if not memory_ids or not self.vector_cfg.enabled:
-            return
-        self.vector_store.delete(memory_ids)
-
-    def _dedupe_rows(self, rows: List[Dict]) -> List[Dict]:
+        out: List[MemoryItem] = []
         seen = set()
-        out: List[Dict] = []
-        for row in rows:
-            key = row.get("memory_id") or f"{row.get('memory_type')}::{row.get('content_hash')}::{row.get('content')}"
-            if key in seen:
+        for item in rows:
+            if item.id in seen:
                 continue
-            seen.add(key)
-            out.append(row)
-        return out
+            seen.add(item.id)
+            out.append(item)
+        return out[: max(int(limit), 1)]
+
+    def _prefixed_entries(self, query: str, prefix: str, limit: int) -> List[MemoryItem]:
+        raw = self._search_entries(query=query, limit=max(limit * 3, limit))
+        prefix_flag = f"{prefix}:"
+        tagged: List[MemoryItem] = []
+        for item in raw:
+            content = str(item.content or "").strip().lower()
+            if content.startswith(prefix_flag):
+                tagged.append(item)
+            if len(tagged) >= max(int(limit), 1):
+                break
+        return tagged[: max(int(limit), 1)]
+
+    def _strip_prefix(self, text: str, prefix: str) -> str:
+        content = str(text or "").strip()
+        prefix_flag = f"{prefix}:"
+        if content.lower().startswith(prefix_flag):
+            return content[len(prefix_flag) :].strip()
+        return content
+
+    def _extract_profile_candidates(self, text: str) -> List[str]:
+        source = str(text or "").strip()
+        if not source:
+            return []
+
+        candidates: List[str] = []
+        for pattern in self.PROFILE_PATTERNS:
+            matched = pattern.search(source)
+            if not matched:
+                continue
+            raw = matched.group(1).strip(" ，,。！？!?\n\t")
+            if not raw:
+                continue
+            pieces = [p.strip(" ，,。！？!?\n\t") for p in self.LIST_SPLIT_RE.split(raw) if p.strip()]
+            candidates.extend(pieces or [raw])
+
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            norm = " ".join(item.lower().split())
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            deduped.append(item)
+            if len(deduped) >= 6:
+                break
+        return deduped
+
+    def _extract_commitment_candidates(self, text: str) -> List[str]:
+        source = str(text or "").strip()
+        if not source:
+            return []
+
+        out: List[str] = []
+        for pattern in self.COMMITMENT_PATTERNS:
+            matched = pattern.search(source)
+            if not matched:
+                continue
+            if len(matched.groups()) == 1:
+                todo = matched.group(1).strip()
+                due = ""
+            else:
+                todo = matched.group(1).strip()
+                due = matched.group(2).strip()
+            if not todo:
+                continue
+            out.append(f"{todo}{f' | due:{due}' if due else ''}")
+
+        deduped: List[str] = []
+        seen = set()
+        for item in out:
+            norm = " ".join(item.lower().split())
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            deduped.append(item)
+        return deduped
+
+    def _extract_topic(self, user_text: str, assistant_reply: str) -> str:
+        def first_clause(text: str) -> str:
+            src = str(text or "").strip()
+            if not src:
+                return ""
+            parts = [p.strip() for p in self.TOPIC_SPLIT_RE.split(src) if p.strip()]
+            return parts[0] if parts else src
+
+        topic = first_clause(user_text)
+        for prefix in ["请帮我", "帮我", "请", "我想让你", "我想", "我希望", "我需要", "能不能", "可以"]:
+            if topic.startswith(prefix):
+                topic = topic[len(prefix) :].strip()
+                break
+
+        if not topic:
+            topic = first_clause(assistant_reply)
+
+        topic = topic.strip() or "本轮对话"
+        if len(topic) > 48:
+            topic = topic[:48].rstrip() + "..."
+        return topic
 
     def close(self) -> None:
         try:
-            self.turn_summarizer.close()
+            self._engine.close()
         except Exception:
             log_exception(
                 logger,
-                "memory.turn_summary.close.error",
-                "Turn summary 关闭失败",
-                component="memory",
-            )
-        try:
-            self.vector_indexer.close()
-        except Exception:
-            log_exception(
-                logger,
-                "memory.vector_indexer.close.error",
-                "向量索引器关闭失败",
+                "memory.engine.close.error",
+                "memory_module 关闭失败",
                 component="memory",
             )

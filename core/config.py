@@ -45,18 +45,10 @@ class ServiceConfig:
 @dataclass
 class MemoryVectorConfig:
     enabled: bool
-    provider: str
     embedding_model: str
     embedding_api_url: str
     embedding_api_key: str
-    qdrant_url: str
-    qdrant_collection: str
     vector_dim: int
-    top_k_vector: int
-    top_k_keyword: int
-    write_async: bool
-    queue_size: int
-    max_retries: int
 
 
 @dataclass
@@ -323,7 +315,6 @@ def _build_memory_vector_config(raw: Dict[str, Any], llm_raw: Dict[str, Any]) ->
 
     cfg = MemoryVectorConfig(
         enabled=enabled,
-        provider=str(os.environ.get("LUMINA_MEMORY_VECTOR_PROVIDER", mv.get("provider", "openai"))).strip() or "openai",
         embedding_model=str(
             os.environ.get("LUMINA_EMBEDDING_MODEL", mv.get("embedding_model", "text-embedding-3-small"))
         ).strip(),
@@ -336,33 +327,9 @@ def _build_memory_vector_config(raw: Dict[str, Any], llm_raw: Dict[str, Any]) ->
                 os.environ.get("LUMINA_API_KEY", mv.get("embedding_api_key", llm_raw.get("chat_api_key", ""))),
             )
         ).strip(),
-        qdrant_url=str(os.environ.get("LUMINA_QDRANT_URL", mv.get("qdrant_url", "http://127.0.0.1:6333"))).strip(),
-        qdrant_collection=str(
-            os.environ.get("LUMINA_QDRANT_COLLECTION", mv.get("qdrant_collection", "lumina_memory_vectors"))
-        ).strip(),
         vector_dim=_to_int(
             os.environ.get("LUMINA_VECTOR_DIM", mv.get("vector_dim", 1536)),
             "memory_vector.vector_dim",
-        ),
-        top_k_vector=_to_int(
-            os.environ.get("LUMINA_VECTOR_TOP_K", mv.get("top_k_vector", 12)),
-            "memory_vector.top_k_vector",
-        ),
-        top_k_keyword=_to_int(
-            os.environ.get("LUMINA_KEYWORD_TOP_K", mv.get("top_k_keyword", 12)),
-            "memory_vector.top_k_keyword",
-        ),
-        write_async=_to_bool(
-            os.environ.get("LUMINA_VECTOR_WRITE_ASYNC", mv.get("write_async", True)),
-            "memory_vector.write_async",
-        ),
-        queue_size=_to_int(
-            os.environ.get("LUMINA_VECTOR_QUEUE_SIZE", mv.get("queue_size", 512)),
-            "memory_vector.queue_size",
-        ),
-        max_retries=_to_int(
-            os.environ.get("LUMINA_VECTOR_MAX_RETRIES", mv.get("max_retries", 3)),
-            "memory_vector.max_retries",
         ),
     )
 
@@ -371,8 +338,6 @@ def _build_memory_vector_config(raw: Dict[str, Any], llm_raw: Dict[str, Any]) ->
             "memory_vector.embedding_model": cfg.embedding_model,
             "memory_vector.embedding_api_url": cfg.embedding_api_url,
             "memory_vector.embedding_api_key": cfg.embedding_api_key,
-            "memory_vector.qdrant_url": cfg.qdrant_url,
-            "memory_vector.qdrant_collection": cfg.qdrant_collection,
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
